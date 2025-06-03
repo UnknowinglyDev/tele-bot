@@ -1,0 +1,2218 @@
+Okay, combining everything into a single, runnable Google Colab script is a large task, but I'll provide a comprehensive script that lays the groundwork. Please understand that:
+
+1.  **Error-Free is a Goal, Not a Guarantee:** A script of this complexity will require testing and debugging in a live environment. I'll aim for logical correctness and syntax accuracy.
+2.  **Placeholders:** You **MUST** replace placeholders (like API keys, file paths) with your actual credentials and settings.
+3.  **Google Sheets & Razorpay:**
+    *   **Google Sheets:** You'll need to upload your `service-account-credentials.json` file to Colab and update the path in the script.
+    *   **Razorpay:** Full Razorpay integration with webhooks is not directly feasible in a standard Colab environment because Colab notebooks aren't typically exposed as public web servers. I'll include the logic to *initiate* a payment and a command to *simulate* a successful payment callback for testing the upgrade flow.
+4.  **Colab Execution:** Keep the Colab notebook running for the bot to be active.
+5.  **YouTube API Quotas:** Be mindful of YouTube Data API quotas, especially with frequent checks.
+6.  **Persistence:** The SQLite database (`bot_data.db`) will be stored in Colab's temporary environment. If the Colab instance resets, the data will be lost unless you explicitly download it or save it to Google Drive.
+
+Here's the combined script:
+
+```python
+# %%capture
+# ^ This Colab magic command captures output of the cell, keeping the notebook clean.
+# Remove it if you want to see pip install logs.
+
+print("Installing dependencies...")
+!pip install python-telegram-bot==13.15 # PTB v13.x uses asyncio but differently than v20+
+!pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+!pip install requests
+!pip install razorpay
+!pip install gspread oauth2client
+!pip install apscheduler # For more robust scheduling, works well with asyncio
+print("Dependencies installed.")
+
+# ==============================================================================
+# CONFIGURATION (IMPORTANT: FILL THESE IN!)
+# ==============================================================================
+import os
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "YOUR_YOUTUBE_API_KEY_HERE")
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "YOUR_RAZORPAY_KEY_ID_HERE") # Not fully used in Colab without webhooks
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "YOUR_RAZORPAY_KEY_SECRET_HERE") # Not fully used
+
+ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", 123456789)) # YOUR Telegram User ID
+
+MANDATORY_JOIN_CHANNEL_ID = os.getenv("MANDATORY_JOIN_CHANNEL_ID", "@YourMandatoryChannelUsername") # e.g., @mybotupdates OR chat_id like -100123456789
+MANDATORY_JOIN_CHANNEL_NAME = "Our Updates Channel"
+
+# --- Google Sheets Configuration ---
+# **Action Required**: Upload your service_account.json to your Colab environment
+# and update the path below.
+# Example: '/content/service-account-credentials.json'
+GSHEET_SERVICE_ACCOUNT_FILE = os.getenv("GSHEET_SERVICE_ACCOUNT_FILE", 'YOUR_SERVICE_ACCOUNT_JSON_PATH_IN_COLAB')
+GSHEET_PREMIUM_USERS_FILE_NAME = os.getenv("GSHEET_PREMIUM_USERS_FILE_NAME", "YouTubeBot_Colab_PremiumUsers")
+GSHEET_PREMIUM_USERS_WORKSHEET_NAME = "Premium Users"
+GSHEET_REFERRALS_WORKSHEET_NAME = "ReferralsLog"
+
+# --- Database ---
+DATABASE_NAME = "bot_data.db"
+
+# --- Logging ---
+LOG_LEVEL = "INFO"
+
+# --- Bot Settings ---
+VIDEO_CHECK_INTERVAL_MINUTES = 5 # Check for new videos every 5 minutes
+REMINDER_CHECK_INTERVAL_MINUTES = 1 # Check for reminders every 1 minute
+
+# ==============================================================================
+# IMPORTS
+# ==============================================================================
+import logging
+import sqlite3
+from datetime import datetime, timedelta, timezone
+import re
+import json
+import time
+import uuid # For unique referral codes
+
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import requests
+import razorpay
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, ChatMember
+)
+from telegram.ext import (
+    Updater, CommandHandler, MessageHandler, Filters, CallbackContext,
+    CallbackQueryHandler, JobQueue, ConversationHandler
+)
+from googleapiclient.discovery import build
+from apscheduler.schedulers.asyncio import AsyncIOScheduler # For background tasks
+
+# ==============================================================================
+# LOGGING SETUP
+# ==============================================================================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO)
+)
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+# User Tiers & Limits
+FREE_TIER_YT_CHANNELS = 3
+FREE_TIER_TG_GROUPS = 3
+
+PREMIUM_PLAN_1_ID = "plan_premium_1"
+PREMIUM_PLAN_1_NAME = "Pro Monthly"
+PREMIUM_PLAN_1_PRICE = 11900  # In paisa (₹119.00)
+PREMIUM_PLAN_1_DURATION_MONTHS = 1
+PREMIUM_PLAN_1_YT_CHANNELS = 10
+
+PREMIUM_PLAN_2_ID = "plan_premium_3m"
+PREMIUM_PLAN_2_NAME = "Pro Quarterly"
+PREMIUM_PLAN_2_PRICE = 29900  # In paisa (₹299.00)
+PREMIUM_PLAN_2_DURATION_MONTHS = 3
+PREMIUM_PLAN_2_YT_CHANNELS = 10
+
+REFERRAL_PREMIUM_DURATION_MONTHS = 3
+REFERRAL_TARGET_COUNT = 3
+
+# Callback Data Prefixes
+CB_CHECK_CHANNELS = "cb_chk_ch"
+CB_VIEW_CHANNEL_DETAILS_PREFIX = "cb_view_ch_detail_" # append DB user_youtube_channel.id
+CB_DELETE_CHANNEL_CONFIRM_PREFIX = "cb_del_ch_conf_"  # append DB user_youtube_channel.id
+CB_DELETE_CHANNEL_DO_PREFIX = "cb_del_ch_do_"       # append DB user_youtube_channel.id
+CB_MANAGE_LINKED_GROUPS_PREFIX = "cb_mng_grps_"    # append DB user_youtube_channel.id
+CB_UNLINK_GROUP_PREFIX = "cb_unlink_grp_"       # append mapping_id
+CB_ADD_GROUP_TO_CHANNEL_PREFIX = "cb_add_grp_ch_"  # append DB user_youtube_channel.id
+
+CB_SCHEDULE_REMINDER_VIDEO_URL = "cb_rem_url" # Part of conversation
+CB_SCHEDULE_REMINDER_MINUTES = "cb_rem_min"   # Part of conversation
+
+CB_BACK_TO_MAIN = "cb_back_main"
+CB_UPGRADE_OPTIONS = "cb_upgrade_opt"
+CB_UPGRADE_PLAN_1 = "cb_upgrade_p1"
+CB_UPGRADE_PLAN_2 = "cb_upgrade_p3m"
+
+CB_ADMIN_MAIN = "cb_admin_main"
+CB_ADMIN_VIEW_USERS = "cb_admin_users"
+CB_ADMIN_VIEW_CONNECTIONS = "cb_admin_conns"
+CB_ADMIN_MANAGE_UPGRADE_USER_INPUT = "cb_admin_man_upg_input" # Part of conversation
+CB_ADMIN_MANAGE_DOWNGRADE_USER_INPUT = "cb_admin_man_dng_input" # Part of conversation
+
+# Conversation states for adding channels, reminders, admin manage upgrades
+ASK_YT_URL, ASK_TG_GROUP_ID = range(2) # For /addchannel
+ASK_REMINDER_URL, ASK_REMINDER_MINUTES = range(2) # For /remindafter
+ASK_USER_ID_FOR_UPGRADE, ASK_MONTHS_FOR_UPGRADE = range(2) # For admin manual upgrade
+ASK_USER_ID_FOR_DOWNGRADE = range(1) # For admin manual downgrade
+ASK_GROUP_ID_FOR_LINKING = range(1) # For adding group via inline keyboard
+
+# ==============================================================================
+# GOOGLE SHEETS UTILITIES (`gdrive_sheets_utils.py` content)
+# ==============================================================================
+_gspread_client = None
+
+def _get_gspread_client():
+    global _gspread_client
+    if _gspread_client is None:
+        try:
+            if not os.path.exists(GSHEET_SERVICE_ACCOUNT_FILE):
+                logger.error(f"Google Sheets service account file not found at: {GSHEET_SERVICE_ACCOUNT_FILE}")
+                logger.error("Please upload your credentials.json and update GSHEET_SERVICE_ACCOUNT_FILE path.")
+                return None
+            scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+            creds = ServiceAccountCredentials.from_json_keyfile_name(GSHEET_SERVICE_ACCOUNT_FILE, scope)
+            _gspread_client = gspread.authorize(creds)
+            logger.info("Google Sheets client initialized.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Sheets client: {e}")
+            return None
+    return _gspread_client
+
+def _get_or_create_worksheet(spreadsheet_name, worksheet_name, headers=None):
+    client = _get_gspread_client()
+    if not client:
+        return None
+    try:
+        spreadsheet = client.open(spreadsheet_name)
+    except gspread.exceptions.SpreadsheetNotFound:
+        logger.info(f"Spreadsheet '{spreadsheet_name}' not found, creating new one.")
+        spreadsheet = client.create(spreadsheet_name)
+        # Share with yourself or others if needed via spreadsheet.share('your-email@example.com', perm_type='user', role='writer')
+    try:
+        worksheet = spreadsheet.worksheet(worksheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        logger.info(f"Worksheet '{worksheet_name}' not found in '{spreadsheet_name}', creating new one.")
+        worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows="100", cols="20")
+        if headers and isinstance(headers, list):
+            worksheet.append_row(headers) # Add headers if worksheet is new and headers are provided
+    return worksheet
+
+def sync_premium_user_to_sheet(user_id, username, premium_expiry_date, plan_name, amount_paid):
+    if not _get_gspread_client(): return
+    worksheet = _get_or_create_worksheet(
+        GSHEET_PREMIUM_USERS_FILE_NAME,
+        GSHEET_PREMIUM_USERS_WORKSHEET_NAME,
+        headers=["User ID", "Username", "Premium Expiry Date", "Plan Name", "Amount Paid (INR)", "Subscription Date"]
+    )
+    if not worksheet: return
+
+    try:
+        cell = worksheet.find(str(user_id), in_column=1) # Find user by ID in the first column
+        row_data = [
+            str(user_id),
+            username or "N/A",
+            premium_expiry_date.strftime('%Y-%m-%d %H:%M:%S') if premium_expiry_date else "N/A",
+            plan_name,
+            f"{amount_paid/100:.2f}",
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        ]
+        if cell:
+            worksheet.update(f'A{cell.row}', [row_data]) # Update existing row
+            logger.info(f"Updated premium user {user_id} in Google Sheet.")
+        else:
+            worksheet.append_row(row_data) # Add new row
+            logger.info(f"Added premium user {user_id} to Google Sheet.")
+    except Exception as e:
+        logger.error(f"Failed to sync premium user {user_id} to Google Sheet: {e}")
+
+def remove_premium_user_from_sheet(user_id):
+    if not _get_gspread_client(): return
+    worksheet = _get_or_create_worksheet(GSHEET_PREMIUM_USERS_FILE_NAME, GSHEET_PREMIUM_USERS_WORKSHEET_NAME)
+    if not worksheet: return
+
+    try:
+        cell = worksheet.find(str(user_id), in_column=1)
+        if cell:
+            # Option 1: Delete row (can be slow if many deletions)
+            # worksheet.delete_rows(cell.row)
+            # Option 2: Mark as expired (better for history)
+            worksheet.update_cell(cell.row, 3, "EXPIRED/CANCELLED") # Assuming 3rd column is expiry
+            worksheet.update_cell(cell.row, 4, "N/A") # Clear plan name
+            logger.info(f"Marked user {user_id} as expired in Google Sheet.")
+        else:
+            logger.info(f"User {user_id} not found in premium Google Sheet for removal.")
+    except Exception as e:
+        logger.error(f"Failed to remove/mark user {user_id} from premium Google Sheet: {e}")
+
+def log_referral_to_sheet(referrer_id, referred_id, referred_username, status):
+    if not _get_gspread_client(): return
+    worksheet = _get_or_create_worksheet(
+        GSHEET_PREMIUM_USERS_FILE_NAME, # Storing in the same sheet for now
+        GSHEET_REFERRALS_WORKSHEET_NAME,
+        headers=["Timestamp", "Referrer User ID", "Referred User ID", "Referred Username", "Status (e.g., SIGNED_UP, BECAME_PREMIUM, REFERRER_REWARDED)"]
+    )
+    if not worksheet: return
+    try:
+        worksheet.append_row([
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            str(referrer_id),
+            str(referred_id),
+            referred_username or "N/A",
+            status
+        ])
+        logger.info(f"Logged referral: {referrer_id} -> {referred_id} ({status}) to Google Sheet.")
+    except Exception as e:
+        logger.error(f"Failed to log referral to Google Sheet: {e}")
+
+
+# ==============================================================================
+# DATABASE UTILITIES (`db_utils.py` content, slightly adapted)
+# ==============================================================================
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_NAME, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def initialize_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Users table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        is_premium BOOLEAN DEFAULT FALSE,
+        premium_expiry_date TIMESTAMP,
+        referral_code TEXT UNIQUE,
+        referred_by_user_id INTEGER, -- User ID of the referrer
+        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    # YouTube Channels (globally unique by youtube_channel_id to avoid duplicates by different users linking same)
+    # But user_youtube_channels tracks user's link to a channel
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS youtube_channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        youtube_channel_id TEXT UNIQUE NOT NULL,
+        youtube_channel_name TEXT,
+        last_fetched_video_id TEXT, -- ID of the latest video processed for this channel by the bot
+        last_checked TIMESTAMP -- When the bot last polled this channel
+    )
+    ''')
+    # User's subscription/link to a YouTube channel
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS user_youtube_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        yt_channel_db_id INTEGER NOT NULL, -- FK to youtube_channels.id
+        date_linked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (user_id),
+        FOREIGN KEY (yt_channel_db_id) REFERENCES youtube_channels (id),
+        UNIQUE (user_id, yt_channel_db_id) -- A user can link a specific YT channel only once
+    )
+    ''')
+    # Telegram Groups/Channels where YouTube videos are posted
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS channel_group_mappings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_subscription_id INTEGER NOT NULL, -- FK to user_youtube_subscriptions.id
+        telegram_chat_id INTEGER NOT NULL, -- Group or Channel ID (can be negative for groups)
+        telegram_chat_title TEXT, -- Store for easier display
+        is_active BOOLEAN DEFAULT TRUE,
+        FOREIGN KEY (user_subscription_id) REFERENCES user_youtube_subscriptions (id),
+        UNIQUE (user_subscription_id, telegram_chat_id) -- One subscription maps to one TG chat only once
+    )
+    ''')
+    # Reminders
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        youtube_video_url TEXT NOT NULL,
+        video_title TEXT,
+        remind_at TIMESTAMP NOT NULL,
+        is_sent BOOLEAN DEFAULT FALSE,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+    )
+    ''')
+    # Referrals tracking
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS referrals_progress (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_user_id INTEGER NOT NULL,
+        referred_user_id INTEGER NOT NULL UNIQUE, -- A user can only be referred once successfully
+        signup_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        became_premium_date TIMESTAMP,
+        referrer_rewarded_date TIMESTAMP,
+        FOREIGN KEY (referrer_user_id) REFERENCES users (user_id),
+        FOREIGN KEY (referred_user_id) REFERENCES users (user_id)
+    )
+    ''')
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized/checked.")
+
+# --- User Functions ---
+def add_or_update_user(user_id, username, first_name, last_name, referred_by_code=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    existing_user = get_user(user_id, conn)
+    referrer_user_id = None
+
+    if referred_by_code and not existing_user: # Only process referral for new users
+        cursor.execute("SELECT user_id FROM users WHERE referral_code = ?", (referred_by_code,))
+        referrer = cursor.fetchone()
+        if referrer and referrer["user_id"] != user_id: # Cannot refer oneself
+            referrer_user_id = referrer["user_id"]
+            logger.info(f"User {user_id} referred by {referrer_user_id} using code {referred_by_code}")
+            # Log initial referral to DB and sheet
+            cursor.execute('''
+                INSERT OR IGNORE INTO referrals_progress (referrer_user_id, referred_user_id) VALUES (?, ?)
+            ''', (referrer_user_id, user_id))
+            log_referral_to_sheet(referrer_user_id, user_id, username, "SIGNED_UP_VIA_REFERRAL")
+
+    try:
+        if existing_user:
+            cursor.execute('''
+            UPDATE users SET username=?, first_name=?, last_name=?
+            WHERE user_id=?
+            ''', (username, first_name, last_name, user_id))
+        else:
+            referral_code = str(uuid.uuid4())[:8].upper() # Generate unique referral code
+            cursor.execute('''
+            INSERT INTO users (user_id, username, first_name, last_name, referral_code, referred_by_user_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, username, first_name, last_name, referral_code, referrer_user_id))
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        logger.error(f"DB IntegrityError for user {user_id}: {e}. User might already exist.")
+    finally:
+        conn.close()
+
+def get_user(user_id, conn_passed=None):
+    conn = conn_passed or get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    user = cursor.fetchone()
+    if not conn_passed: conn.close()
+    return user
+
+def set_user_premium_status(user_id, plan_id, duration_months, amount_paid, payment_id="MANUAL_ADMIN"):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    user = get_user(user_id, conn)
+    if not user:
+        logger.error(f"Attempted to upgrade non-existent user {user_id}")
+        conn.close()
+        return False
+
+    current_expiry = user['premium_expiry_date']
+    if current_expiry and current_expiry > datetime.now(timezone.utc):
+        start_date = current_expiry
+    else:
+        start_date = datetime.now(timezone.utc)
+
+    new_expiry_date = start_date + timedelta(days=duration_months * 30.4375) # More precise average for months
+
+    try:
+        cursor.execute('''
+        UPDATE users SET is_premium = TRUE, premium_expiry_date = ?
+        WHERE user_id = ?
+        ''', (new_expiry_date, user_id))
+        conn.commit()
+        logger.info(f"User {user_id} upgraded to premium. Plan: {plan_id}. Expiry: {new_expiry_date}. Payment ID: {payment_id}")
+
+        plan_name = "Unknown Plan"
+        if plan_id == PREMIUM_PLAN_1_ID: plan_name = PREMIUM_PLAN_1_NAME
+        elif plan_id == PREMIUM_PLAN_2_ID: plan_name = PREMIUM_PLAN_2_NAME
+        elif plan_id == "REFERRAL_REWARD": plan_name = "Referral Reward"
+        elif plan_id == "ADMIN_GRANT": plan_name = "Admin Granted Premium"
+
+
+        sync_premium_user_to_sheet(user_id, user['username'], new_expiry_date, plan_name, amount_paid)
+
+        # --- Referral Fulfillment ---
+        if user['referred_by_user_id']:
+            cursor.execute('''
+                UPDATE referrals_progress
+                SET became_premium_date = CURRENT_TIMESTAMP
+                WHERE referred_user_id = ? AND referrer_rewarded_date IS NULL
+            ''', (user_id,))
+            if cursor.rowcount > 0:
+                logger.info(f"User {user_id} (referred) became premium. Updating referral progress for referrer {user['referred_by_user_id']}.")
+                log_referral_to_sheet(user['referred_by_user_id'], user_id, user['username'], "BECAME_PREMIUM")
+                # Check if referrer now qualifies for reward
+                check_and_grant_referral_reward(user['referred_by_user_id'], conn)
+        conn.commit() # Commit again after referral logic
+        return True
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error upgrading user {user_id}: {e}")
+        return False
+    finally:
+        conn.close()
+
+def check_and_grant_referral_reward(referrer_user_id, conn_passed=None):
+    conn = conn_passed or get_db_connection()
+    cursor = conn.cursor()
+    # Count successful, unrewarded referrals for this referrer
+    cursor.execute('''
+        SELECT COUNT(*) as premium_referrals
+        FROM referrals_progress
+        WHERE referrer_user_id = ? AND became_premium_date IS NOT NULL AND referrer_rewarded_date IS NULL
+    ''', (referrer_user_id,))
+    result = cursor.fetchone()
+    
+    if result and result['premium_referrals'] >= REFERRAL_TARGET_COUNT:
+        logger.info(f"Referrer {referrer_user_id} has {result['premium_referrals']} premium referrals. Awarding premium.")
+        # Grant premium to referrer
+        set_user_premium_status(referrer_user_id, "REFERRAL_REWARD", REFERRAL_PREMIUM_DURATION_MONTHS, 0) # 0 amount for reward
+
+        # Mark these referrals as rewarded for this referrer
+        cursor.execute('''
+            UPDATE referrals_progress
+            SET referrer_rewarded_date = CURRENT_TIMESTAMP
+            WHERE referrer_user_id = ? AND became_premium_date IS NOT NULL AND referrer_rewarded_date IS NULL
+            LIMIT ? 
+        ''', (referrer_user_id, REFERRAL_TARGET_COUNT)) # Mark only N referrals as used for this reward cycle
+        
+        referrer = get_user(referrer_user_id, conn)
+        if referrer:
+            log_referral_to_sheet(referrer_user_id, "N/A", referrer['username'], f"REWARDED_PREMIUM_{REFERRAL_PREMIUM_DURATION_MONTHS}_MONTHS")
+        conn.commit()
+
+        # Notify referrer (implement a function send_telegram_message_to_user(user_id, message))
+        # Example: send_telegram_message_to_user(referrer_user_id, f"Congratulations! You've successfully referred {REFERRAL_TARGET_COUNT} users who upgraded to premium. You've been awarded {REFERRAL_PREMIUM_DURATION_MONTHS} months of premium for free!")
+
+    if not conn_passed: conn.close()
+
+def expire_premium_users_job(context: CallbackContext):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now_utc = datetime.now(timezone.utc)
+    logger.info(f"Running premium check job at {now_utc}")
+    cursor.execute('''
+        SELECT user_id, username FROM users
+        WHERE is_premium = TRUE AND premium_expiry_date < ?
+    ''', (now_utc,))
+    expired_users = cursor.fetchall()
+
+    for user_row in expired_users:
+        user_id = user_row['user_id']
+        username = user_row['username']
+        cursor.execute('''
+            UPDATE users SET is_premium = FALSE, premium_expiry_date = NULL
+            WHERE user_id = ?
+        ''', (user_id,))
+        conn.commit()
+        logger.info(f"Premium expired for user {user_id} ({username}). Downgraded to free tier.")
+        remove_premium_user_from_sheet(user_id) # Update Google Sheet
+        try:
+            context.bot.send_message(
+                chat_id=user_id,
+                text="Your premium subscription has expired. You are now on the free tier. Use /upgrade to renew."
+            )
+        except Exception as e:
+            logger.error(f"Failed to send premium expiry notification to {user_id}: {e}")
+    conn.close()
+
+def get_user_channel_limit(user_id):
+    user = get_user(user_id)
+    if not user: return FREE_TIER_YT_CHANNELS
+    is_premium = user['is_premium']
+    if is_premium:
+        expiry = user['premium_expiry_date']
+        if expiry and expiry > datetime.now(timezone.utc):
+            # For simplicity, both premium plans have same channel limit now
+            return PREMIUM_PLAN_1_YT_CHANNELS
+        else: # Expired premium
+            # Handled by expire_premium_users_job, but double check here
+            if user['is_premium']: # if job hasn't run yet, manually update this instance
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET is_premium = FALSE, premium_expiry_date = NULL WHERE user_id = ?", (user_id,))
+                conn.commit()
+                conn.close()
+                remove_premium_user_from_sheet(user_id)
+            return FREE_TIER_YT_CHANNELS
+    return FREE_TIER_YT_CHANNELS
+
+def get_user_group_limit(user_id): # Per YT channel or total? Assuming total linked groups limit for simplicity.
+    # This is a simplified example; you might want different group limits for premium
+    user = get_user(user_id)
+    if not user: return FREE_TIER_TG_GROUPS
+    is_premium = user['is_premium']
+    if is_premium and user['premium_expiry_date'] and user['premium_expiry_date'] > datetime.now(timezone.utc):
+        return PREMIUM_PLAN_1_YT_CHANNELS * 2 # Example: Premium gets more groups
+    return FREE_TIER_TG_GROUPS
+
+# --- Channel & Mapping Functions ---
+def add_or_get_youtube_channel_db_entry(yt_channel_id, yt_channel_name):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, youtube_channel_name FROM youtube_channels WHERE youtube_channel_id = ?", (yt_channel_id,))
+    channel = cursor.fetchone()
+    if channel:
+        # Update name if it has changed
+        if channel['youtube_channel_name'] != yt_channel_name:
+            cursor.execute("UPDATE youtube_channels SET youtube_channel_name = ? WHERE id = ?", (yt_channel_name, channel['id']))
+            conn.commit()
+        yt_channel_db_id = channel['id']
+    else:
+        cursor.execute("INSERT INTO youtube_channels (youtube_channel_id, youtube_channel_name) VALUES (?, ?)", (yt_channel_id, yt_channel_name))
+        conn.commit()
+        yt_channel_db_id = cursor.lastrowid
+    conn.close()
+    return yt_channel_db_id
+
+def add_user_subscription_to_yt_channel(user_id, yt_channel_db_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO user_youtube_subscriptions (user_id, yt_channel_db_id) VALUES (?, ?)", (user_id, yt_channel_db_id))
+        conn.commit()
+        user_subscription_id = cursor.lastrowid
+        return user_subscription_id
+    except sqlite3.IntegrityError: # User already subscribed to this channel
+        logger.warning(f"User {user_id} already subscribed to YT channel DB ID {yt_channel_db_id}.")
+        cursor.execute("SELECT id FROM user_youtube_subscriptions WHERE user_id = ? AND yt_channel_db_id = ?", (user_id, yt_channel_db_id))
+        existing_sub = cursor.fetchone()
+        return existing_sub['id'] if existing_sub else None
+    finally:
+        conn.close()
+
+def link_user_subscription_to_telegram_group(user_subscription_id, telegram_chat_id, telegram_chat_title="N/A"):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+        INSERT INTO channel_group_mappings (user_subscription_id, telegram_chat_id, telegram_chat_title)
+        VALUES (?, ?, ?)
+        ''', (user_subscription_id, telegram_chat_id, telegram_chat_title))
+        conn.commit()
+        mapping_id = cursor.lastrowid
+        conn.close()
+        return mapping_id
+    except sqlite3.IntegrityError:
+        logger.warning(f"Subscription {user_subscription_id} already linked to chat {telegram_chat_id}.")
+        conn.close()
+        return None
+
+def get_user_subscribed_yt_channels(user_id): # Returns list of dicts {sub_id, yt_id, yt_name, yt_channel_id_str}
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT
+            uys.id as user_subscription_id,
+            yc.id as yt_channel_db_id,
+            yc.youtube_channel_name,
+            yc.youtube_channel_id as yt_channel_id_str
+        FROM user_youtube_subscriptions uys
+        JOIN youtube_channels yc ON uys.yt_channel_db_id = yc.id
+        WHERE uys.user_id = ?
+    ''', (user_id,))
+    channels = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in channels]
+
+
+def get_linked_telegram_groups_for_user_subscription(user_subscription_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id as mapping_id, telegram_chat_id, telegram_chat_title
+        FROM channel_group_mappings
+        WHERE user_subscription_id = ? AND is_active = TRUE
+    ''', (user_subscription_id,))
+    groups = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in groups]
+
+
+def count_user_linked_channels(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) as count FROM user_youtube_subscriptions WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result['count'] if result else 0
+
+def count_user_total_linked_groups(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT COUNT(cgm.id) as count
+        FROM channel_group_mappings cgm
+        JOIN user_youtube_subscriptions uys ON cgm.user_subscription_id = uys.id
+        WHERE uys.user_id = ? AND cgm.is_active = TRUE
+    ''', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result['count'] if result else 0
+
+def remove_user_yt_channel_subscription(user_subscription_id_to_delete):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # First, delete associated group mappings
+        cursor.execute("DELETE FROM channel_group_mappings WHERE user_subscription_id = ?", (user_subscription_id_to_delete,))
+        # Then, delete the user's subscription to the channel
+        cursor.execute("DELETE FROM user_youtube_subscriptions WHERE id = ?", (user_subscription_id_to_delete,))
+        conn.commit()
+        logger.info(f"Successfully deleted user subscription ID {user_subscription_id_to_delete} and its group mappings.")
+        return True
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error deleting user subscription ID {user_subscription_id_to_delete}: {e}")
+        return False
+    finally:
+        conn.close()
+
+def unlink_telegram_group_from_subscription(mapping_id_to_delete):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM channel_group_mappings WHERE id = ?", (mapping_id_to_delete,))
+        # Or mark as inactive: cursor.execute("UPDATE channel_group_mappings SET is_active = FALSE WHERE id = ?", (mapping_id_to_delete,))
+        conn.commit()
+        logger.info(f"Successfully unlinked mapping ID {mapping_id_to_delete}.")
+        return True
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error unlinking mapping ID {mapping_id_to_delete}: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+# --- Reminder Functions ---
+def add_reminder(user_id, video_url, video_title, remind_at_datetime):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+    INSERT INTO reminders (user_id, youtube_video_url, video_title, remind_at)
+    VALUES (?, ?, ?, ?)
+    ''', (user_id, video_url, video_title, remind_at_datetime))
+    conn.commit()
+    conn.close()
+
+def get_due_reminders():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now_utc = datetime.now(timezone.utc)
+    cursor.execute('''
+    SELECT id, user_id, youtube_video_url, video_title FROM reminders
+    WHERE is_sent = FALSE AND remind_at <= ?
+    ''', (now_utc,))
+    reminders = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in reminders]
+
+def mark_reminder_sent(reminder_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE reminders SET is_sent = TRUE WHERE id = ?", (reminder_id,))
+    conn.commit()
+    conn.close()
+
+# --- Admin Data Fetching ---
+def get_all_users_data_for_admin():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username, first_name, is_premium, premium_expiry_date, join_date FROM users ORDER BY join_date DESC")
+    users = cursor.fetchall()
+    conn.close()
+    return [dict(u) for u in users]
+
+def get_all_connections_for_admin():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT
+            u.user_id, u.username,
+            yc.youtube_channel_name, yc.youtube_channel_id,
+            cgm.telegram_chat_id, cgm.telegram_chat_title
+        FROM users u
+        JOIN user_youtube_subscriptions uys ON u.user_id = uys.user_id
+        JOIN youtube_channels yc ON uys.yt_channel_db_id = yc.id
+        JOIN channel_group_mappings cgm ON uys.id = cgm.user_subscription_id
+        WHERE cgm.is_active = TRUE
+        ORDER BY u.user_id, yc.youtube_channel_name
+    ''')
+    connections = cursor.fetchall()
+    conn.close()
+    return [dict(c) for c in connections]
+
+
+# ==============================================================================
+# YOUTUBE UTILITIES (`youtube_utils.py` content)
+# ==============================================================================
+_youtube_service = None
+
+def get_youtube_service():
+    global _youtube_service
+    if _youtube_service is None:
+        try:
+            _youtube_service = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY, cache_discovery=False)
+            logger.info("YouTube service client initialized.")
+        except Exception as e:
+            logger.error(f"Failed to initialize YouTube service client: {e}")
+            return None
+    return _youtube_service
+
+def extract_channel_id_from_url(url):
+    # Pattern for channel URLs like /channel/UC...
+    match = re.search(r'(?:youtube\.com|youtu\.be)/(?:channel/|c/|user/|@)?([^/?&\s]+)', url)
+    if not match:
+        return None
+    
+    identifier = match.group(1)
+
+    # If it looks like a channel ID directly
+    if identifier.startswith('UC') and len(identifier) == 24:
+        return identifier
+
+    # If it's a custom URL (/c/ChannelName), @handle, or legacy /user/username
+    # We need to make an API call to resolve it to a channel ID
+    youtube = get_youtube_service()
+    if not youtube: return None
+
+    try:
+        # Search for channels by this identifier. It could be a custom URL name or @handle.
+        # For /user/ links, it's tricky as 'forUsername' is deprecated for search.
+        # A common strategy is to try Search: list and if not, Channels: list with 'id' if possible
+        # or scrape the page (not recommended).
+        # For robust solution, check various methods:
+        
+        # 1. Try with Search:list for 'q' as identifier (might return videos or playlists too)
+        # search_response = youtube.search().list(q=identifier, type="channel", part="snippet", maxResults=1).execute()
+        # if search_response.get("items"):
+        #    return search_response["items"][0]["snippet"]["channelId"]
+
+        # 2. A more direct approach for handles (@handle) or known custom names:
+        # Channels: list with 'forHandle' (new API feature if available, else fallback) or 'id'
+        # As of now, 'forHandle' is not a direct parameter in Channels.list. The best way is usually a Search.
+        # Let's try finding a video from that user/customURL and get channelId from it.
+        if identifier.startswith('@'): # It's a handle
+            handle_name = identifier[1:] # Remove @
+            request = youtube.channels().list(
+                part="id",
+                forHandle=handle_name # This requires API v3 to support forHandle
+            )
+            try:
+                response = request.execute()
+                if response.get("items"):
+                    return response["items"][0]["id"]
+            except Exception as e_handle:
+                 logger.warning(f"API call for handle '{handle_name}' failed: {e_handle}. Trying search.")
+
+
+        # Fallback: General Search. This can be less reliable for /c/ or /user/
+        # Try searching for the identifier, hoping it's the channel name or custom URL
+        request = youtube.search().list(
+            part="snippet",
+            q=identifier,
+            type="channel",
+            maxResults=1
+        )
+        response = request.execute()
+        if response.get("items"):
+            channel_id = response["items"][0]["snippet"]["channelId"]
+            logger.info(f"Resolved identifier '{identifier}' to channel ID '{channel_id}' via search.")
+            return channel_id
+        else: # if search doesn't work, this identifier might be the ID itself (legacy /user/username being username=channelid)
+             # Or if it's from /user/, it might be the username itself which sometimes can be used in channels list with ID.
+            try:
+                channel_response = youtube.channels().list(part='snippet', id=identifier).execute()
+                if channel_response.get('items'):
+                    return channel_response['items'][0]['id'] # Confirmed it's an ID
+            except Exception as e_direct_id:
+                 logger.info(f"Identifier '{identifier}' not a direct channel ID: {e_direct_id}")
+
+
+        # If it was an old /user/username link, those are hard to resolve directly without scraping or knowing a video.
+        # The API is moving away from username lookups. Best practice is user provides actual Channel ID.
+        logger.warning(f"Could not directly resolve '{identifier}' to a channel ID. The URL might be a legacy /user/ or ambiguous.")
+        return None # Could not resolve non-UC ID with current methods
+
+    except Exception as e:
+        logger.error(f"Error extracting channel ID for identifier '{identifier}': {e}")
+        return None
+
+
+def get_channel_details(channel_id):
+    youtube = get_youtube_service()
+    if not youtube: return None, "YouTube API service unavailable."
+    try:
+        request = youtube.channels().list(
+            part="snippet,contentDetails,statistics", # Add statistics for sub count, etc.
+            id=channel_id
+        )
+        response = request.execute()
+        if response.get("items"):
+            return response["items"][0], None
+        return None, "Channel not found."
+    except Exception as e:
+        logger.error(f"Error fetching details for channel ID {channel_id}: {e}")
+        return None, f"API error: {e}"
+
+
+def get_latest_videos_from_channel(channel_id, count=5, published_after_iso=None):
+    youtube = get_youtube_service()
+    if not youtube: return [], "YouTube API service unavailable."
+    try:
+        # To get uploads from a channel, we first get its 'uploads' playlist ID
+        channel_info, error = get_channel_details(channel_id)
+        if error or not channel_info:
+            return [], error or "Could not get channel info."
+
+        uploads_playlist_id = channel_info["contentDetails"]["relatedPlaylists"]["uploads"]
+
+        request_params = {
+            'part': "snippet,contentDetails",
+            'playlistId': uploads_playlist_id,
+            'maxResults': count
+        }
+        # API does not support publishedAfter for playlistItems directly, this filtering is post-fetch
+        # If we needed to use publishedAfter in API, we'd use search.list with channelId and order by date
+        
+        response = youtube.playlistItems().list(**request_params).execute()
+        videos = []
+        for item in response.get("items", []):
+            video_data = {
+                "id": item["snippet"]["resourceId"]["videoId"],
+                "title": item["snippet"]["title"],
+                "published_at_iso": item["contentDetails"]["videoPublishedAt"], # ISO 8601 format
+                "description": item["snippet"]["description"][:200] # Truncate description
+            }
+            # Post-fetch filter by published_after_iso if provided
+            if published_after_iso:
+                video_published_dt = datetime.fromisoformat(video_data["published_at_iso"].replace('Z', '+00:00'))
+                filter_dt = datetime.fromisoformat(published_after_iso.replace('Z', '+00:00'))
+                if video_published_dt <= filter_dt:
+                    continue # Skip older or same videos
+            videos.append(video_data)
+        
+        # Videos from playlistItems are typically newest first, so reverse if you want oldest of the new ones first.
+        # For finding *new* videos, this order is fine (process newest first).
+        return videos, None
+
+    except Exception as e:
+        logger.error(f"Error fetching latest videos for channel {channel_id}: {e}")
+        return [], f"API error: {e}"
+
+def get_video_details_from_url(video_url):
+    match = re.search(r"(?:v=|\/embed\/|\.be\/)([a-zA-Z0-9_-]{11})", video_url)
+    if not match:
+        return None, "Invalid YouTube video URL."
+    video_id = match.group(1)
+
+    youtube = get_youtube_service()
+    if not youtube: return None, "YouTube API service unavailable."
+    try:
+        request = youtube.videos().list(
+            part="snippet",
+            id=video_id
+        )
+        response = request.execute()
+        if response.get("items"):
+            snippet = response["items"][0]["snippet"]
+            return {
+                "id": video_id,
+                "title": snippet["title"],
+                "channel_id": snippet["channelId"],
+                "channel_title": snippet["channelTitle"]
+            }, None
+        return None, "Video not found."
+    except Exception as e:
+        logger.error(f"Error fetching video details for {video_url}: {e}")
+        return None, f"API error: {e}"
+
+
+# ==============================================================================
+# PAYMENT UTILITIES (`payment_utils.py` content, adapted for Colab)
+# ==============================================================================
+razorpay_client = None
+if RAZORPAY_KEY_ID and RAZORPAY_KEY_ID != "YOUR_RAZORPAY_KEY_ID_HERE":
+    razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+    logger.info("Razorpay client initialized.")
+else:
+    logger.warning("Razorpay Key ID not configured. Payment features will be limited/mocked.")
+
+def create_razorpay_order(amount_paisa, currency="INR", receipt_id=None):
+    if not razorpay_client:
+        logger.error("Razorpay client not initialized. Cannot create order.")
+        return None, "Payment system not configured."
+
+    if receipt_id is None:
+        receipt_id = f"receipt_{int(time.time())}"
+
+    data = {
+        "amount": amount_paisa,
+        "currency": currency,
+        "receipt": receipt_id,
+        "payment_capture": 1 # Auto capture
+    }
+    try:
+        order = razorpay_client.order.create(data=data)
+        logger.info(f"Razorpay order created: {order['id']} for amount {amount_paisa/100} {currency}")
+        return order, None
+    except Exception as e:
+        logger.error(f"Razorpay order creation failed: {e}")
+        return None, f"Payment gateway error: {str(e)}"
+
+# In a real app, a webhook would call this. For Colab, we'll simulate with a command.
+def handle_successful_payment(user_id, payment_id, order_id, plan_id, amount_paid):
+    duration_months = 0
+    if plan_id == PREMIUM_PLAN_1_ID:
+        duration_months = PREMIUM_PLAN_1_DURATION_MONTHS
+    elif plan_id == PREMIUM_PLAN_2_ID:
+        duration_months = PREMIUM_PLAN_2_DURATION_MONTHS
+    else:
+        logger.error(f"Unknown plan_id '{plan_id}' in successful payment for user {user_id}")
+        return False, "Invalid plan ID."
+
+    if duration_months > 0:
+        success = set_user_premium_status(user_id, plan_id, duration_months, amount_paid, payment_id)
+        if success:
+            logger.info(f"User {user_id} successfully upgraded via simulated payment. Order: {order_id}, Plan: {plan_id}")
+            return True, f"Successfully upgraded! You are now on a premium plan for {duration_months} months."
+        else:
+            logger.error(f"DB error during upgrade for user {user_id} after payment.")
+            return False, "Upgrade successful, but there was an issue updating your account. Please contact admin."
+    return False, "Plan duration not set."
+
+# ==============================================================================
+# KEYBOARD DEFINITIONS (`keyboards.py` content)
+# ==============================================================================
+def main_menu_keyboard(user_id):
+    buttons = [
+        [
+            InlineKeyboardButton("🔗 My YouTube Channels", callback_data=CB_CHECK_CHANNELS),
+            InlineKeyboardButton("🗓️ Set Video Reminder", callback_data=CB_SCHEDULE_REMINDER_VIDEO_URL), # Start convo
+        ],
+        [
+            InlineKeyboardButton("🚀 Upgrade Plan", callback_data=CB_UPGRADE_OPTIONS),
+            InlineKeyboardButton("ℹ️ Help & Commands", callback_data="cb_help"),
+        ]
+    ]
+    user = get_user(user_id)
+    if user and user['referral_code']:
+        buttons.append([InlineKeyboardButton(f"🤝 My Referral Code: {user['referral_code']}", callback_data="cb_my_referral_code")])
+
+    if user_id == ADMIN_TELEGRAM_ID:
+        buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data=CB_ADMIN_MAIN)])
+    return InlineKeyboardMarkup(buttons)
+
+def back_to_main_button():
+    return [InlineKeyboardButton("🔙 Main Menu", callback_data=CB_BACK_TO_MAIN)]
+
+def back_button(callback_data_to_go_back_to):
+     return [InlineKeyboardButton("⬅️ Back", callback_data=callback_data_to_go_back_to)]
+
+def upgrade_options_keyboard():
+    keyboard = [
+        [InlineKeyboardButton(f"Pro: {PREMIUM_PLAN_1_YT_CHANNELS} Channels (₹{PREMIUM_PLAN_1_PRICE/100:.2f}/month)", callback_data=CB_UPGRADE_PLAN_1)],
+        [InlineKeyboardButton(f"Pro: {PREMIUM_PLAN_2_YT_CHANNELS} Channels (₹{PREMIUM_PLAN_2_PRICE/100:.2f}/3 months - Discounted)", callback_data=CB_UPGRADE_PLAN_2)],
+        back_to_main_button()
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def user_channels_keyboard(user_id):
+    channels = get_user_subscribed_yt_channels(user_id)
+    keyboard = []
+    if not channels:
+        keyboard.append([InlineKeyboardButton("No channels linked yet. Use /addchannel.", callback_data="cb_info_no_channels")])
+    for ch in channels:
+        keyboard.append([InlineKeyboardButton(f"{ch['youtube_channel_name']} ({ch['yt_channel_id_str']})", callback_data=f"{CB_VIEW_CHANNEL_DETAILS_PREFIX}{ch['user_subscription_id']}")])
+    keyboard.append(back_to_main_button())
+    return InlineKeyboardMarkup(keyboard)
+
+def channel_details_keyboard(user_subscription_id, channel_name):
+    keyboard = [
+        [InlineKeyboardButton(f"➕ Link to new TG Group/Channel", callback_data=f"{CB_ADD_GROUP_TO_CHANNEL_PREFIX}{user_subscription_id}")],
+        [InlineKeyboardButton(f"📋 Manage Linked TG Groups", callback_data=f"{CB_MANAGE_LINKED_GROUPS_PREFIX}{user_subscription_id}")],
+        [InlineKeyboardButton(f"🗑️ Unlink '{channel_name}' from Bot", callback_data=f"{CB_DELETE_CHANNEL_CONFIRM_PREFIX}{user_subscription_id}")],
+        back_button(CB_CHECK_CHANNELS) # Back to "My YouTube Channels" list
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def confirm_delete_channel_keyboard(user_subscription_id, channel_name):
+    keyboard = [
+        [InlineKeyboardButton(f"✅ Yes, Unlink '{channel_name}'", callback_data=f"{CB_DELETE_CHANNEL_DO_PREFIX}{user_subscription_id}")],
+        [InlineKeyboardButton("❌ No, Keep It", callback_data=f"{CB_VIEW_CHANNEL_DETAILS_PREFIX}{user_subscription_id}")] # Back to channel detail
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def manage_linked_groups_keyboard(user_subscription_id, yt_channel_name):
+    linked_groups = get_linked_telegram_groups_for_user_subscription(user_subscription_id)
+    keyboard = []
+    if not linked_groups:
+        keyboard.append([InlineKeyboardButton("No Telegram groups linked to this channel yet.", callback_data="cb_info_no_linked_groups")])
+    for group in linked_groups:
+        title = group['telegram_chat_title'] or str(group['telegram_chat_id'])
+        keyboard.append([InlineKeyboardButton(f"❌ Unlink '{title}'", callback_data=f"{CB_UNLINK_GROUP_PREFIX}{group['mapping_id']}")])
+    keyboard.append(back_button(f"{CB_VIEW_CHANNEL_DETAILS_PREFIX}{user_subscription_id}")) # Back to this specific channel's details
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_main_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📊 View All Users", callback_data=CB_ADMIN_VIEW_USERS)],
+        [InlineKeyboardButton("🔗 View All Connections", callback_data=CB_ADMIN_VIEW_CONNECTIONS)],
+        [InlineKeyboardButton("🔼 Manually Upgrade User", callback_data=CB_ADMIN_MANAGE_UPGRADE_USER_INPUT)], # Starts convo
+        [InlineKeyboardButton("🔽 Manually Downgrade User", callback_data=CB_ADMIN_MANAGE_DOWNGRADE_USER_INPUT)], # Starts convo
+        back_to_main_button()
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ==============================================================================
+# MIDDLEWARE / DECORATORS (For Join Channel Check)
+# ==============================================================================
+from functools import wraps
+
+def check_join_channel(func):
+    @wraps(func)
+    def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
+        user_id = update.effective_user.id
+        if user_id == ADMIN_TELEGRAM_ID: # Admin bypasses this check
+             return func(update, context, *args, **kwargs)
+
+        if MANDATORY_JOIN_CHANNEL_ID and MANDATORY_JOIN_CHANNEL_ID != "@YourMandatoryChannelUsername":
+            try:
+                member_status = context.bot.get_chat_member(chat_id=MANDATORY_JOIN_CHANNEL_ID, user_id=user_id).status
+                if member_status not in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.CREATOR]:
+                    join_channel_link = MANDATORY_JOIN_CHANNEL_ID
+                    if not MANDATORY_JOIN_CHANNEL_ID.startswith('@'):
+                         # For private channels, you need an invite link context.bot.create_chat_invite_link(...)
+                         # This requires bot to be admin in the channel with can_invite_users perm.
+                         # For simplicity, assuming public channel or direct link is known.
+                         # Public channel format: https://t.me/YourMandatoryChannelUsername
+                         join_channel_link = f"https://t.me/{MANDATORY_JOIN_CHANNEL_ID[1:]}" if MANDATORY_JOIN_CHANNEL_ID.startswith('@') else f"The channel link for ID {MANDATORY_JOIN_CHANNEL_ID}"
+
+                    update.effective_message.reply_text(
+                        f"To use this bot, please join our updates channel: {MANDATORY_JOIN_CHANNEL_NAME}\n"
+                        f"Link: {join_channel_link}\n\n"
+                        "Once joined, please try your command again."
+                    )
+                    return ConversationHandler.END # End conversation if in one
+                else: # User is a member
+                    return func(update, context, *args, **kwargs)
+            except Exception as e:
+                logger.error(f"Error checking join status for {user_id} in {MANDATORY_JOIN_CHANNEL_ID}: {e}")
+                if "Chat not found" in str(e) or "user not found" in str(e):
+                    update.effective_message.reply_text("There's an issue with the mandatory join channel configuration. Please contact admin.")
+                elif "not enough rights" in str(e) or "bot is not a member" in str(e): # Bot needs to be in the channel, or its admin.
+                     update.effective_message.reply_text("Bot configuration error for channel join check. Admin has been notified.")
+                     logger.error(f"Bot needs to be admin or member of {MANDATORY_JOIN_CHANNEL_ID} to check member status.")
+                else:
+                    update.effective_message.reply_text("Could not verify channel membership. Please try again or contact support.")
+                return ConversationHandler.END # End conversation if in one
+        else: # No mandatory channel configured
+            return func(update, context, *args, **kwargs)
+    return wrapped
+
+
+# ==============================================================================
+# TELEGRAM HANDLERS (`telegram_handlers.py` content)
+# ==============================================================================
+
+# --- Command Handlers ---
+@check_join_channel
+def start_command(update: Update, context: CallbackContext):
+    user = update.effective_user
+    # Check for referral code in /start command: /start ref_XXXXXXXX
+    ref_code = context.args[0] if context.args else None
+
+    add_or_update_user(user.id, user.username, user.first_name, user.last_name, ref_code)
+
+    welcome_message = (
+        f"👋 Welcome to the YouTube Auto-Poster Bot, {user.first_name}!\n\n"
+        "I can help you automatically post new videos from YouTube channels to your Telegram groups/channels.\n\n"
+        "Here's how to get started:\n"
+        "1. Use `/addchannel <YouTube_Channel_URL> <Target_Telegram_GroupID_or_@ChannelUsername>` to link a channel.\n"
+        "   (Make sure I am an admin in the target group/channel with permission to post messages!)\n"
+        "2. Explore options via the menu below or use `/help` for more commands.\n"
+    )
+    if ref_code:
+         welcome_message += f"\nThanks for using a referral code!"
+
+    user_db = get_user(user.id)
+    if user_db and user_db['referral_code']:
+         welcome_message += f"\n\nYour referral code is: `{user_db['referral_code']}` (tap to copy).\nShare it with friends! If 3 referred friends upgrade to premium, you get {REFERRAL_PREMIUM_DURATION_MONTHS} months of premium FREE!"
+
+
+    update.message.reply_text(welcome_message, reply_markup=main_menu_keyboard(user.id), parse_mode=ParseMode.MARKDOWN)
+
+@check_join_channel
+def help_command(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    help_text = (
+        "✨ **Available Commands** ✨\n\n"
+        "`/start` - Initialize the bot & show main menu.\n"
+        "`/help` - Display this help message.\n"
+        "`/addchannel <YouTube_URL> <GroupID_or_@Username>` - Connect a YouTube channel to a Telegram group/channel.\n"
+        "   Example 1 (Public Channel): `/addchannel https://www.youtube.com/channel/UCK8sQmJBcuz بروکسل اروپا @mytelegramchannel`\n"
+        "   Example 2 (Group ID - find with @RawDataBot): `/addchannel https://www.youtube.com/@MrBeast -1001234567890`\n"
+        "`/list` - View your connected YouTube channels (also in menu).\n"
+        "`/remindafter <YouTube_Video_URL> <Minutes>` - Set a reminder for a YouTube video.\n"
+        "   Example: `/remindafter https://youtu.be/dQw4w9WgXcQ 60`\n"
+        "`/upgrade` - View premium upgrade options (also in menu).\n"
+        "`/myreferral` - Get your personal referral code.\n\n"
+        "**Using the Menu:**\n"
+        "The inline buttons provide quick access to most features including managing your connections.\n\n"
+        "**Important for `/addchannel`**:\n"
+        "- The bot must be an **admin in the target Telegram group/channel** with permissions to post messages.\n"
+        "- For groups, you need the **Group ID** (usually a negative number). You can get this from bots like `@RawDataBot` or `@getidsbot` by adding them to your group and checking the 'chat' object's 'id'.\n"
+        "- For public channels, use the `@channelusername`.\n\n"
+        "**Free Tier Limits:**\n"
+        f"- Link up to {FREE_TIER_YT_CHANNELS} YouTube channels.\n"
+        f"- Link up to {FREE_TIER_TG_GROUPS} total Telegram groups/channels.\n"
+        "Upgrade to premium for higher limits!\n"
+    )
+    if user_id == ADMIN_TELEGRAM_ID:
+        help_text += "\n👑 **Admin Commands:**\n`/admin` - Access the admin panel.\n"
+        help_text += "`/simpayment <user_id> <plan_id: plan_premium_1 or plan_premium_3m> <amount_paisa>` - Simulate successful payment for a user.\n"
+        help_text += "   Example: `/simpayment 123456 plan_premium_1 11900`"
+
+    update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard(user_id))
+
+@check_join_channel
+def my_referral_command(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+    if user and user['referral_code']:
+        text = (f"Your personal referral code is: `{user['referral_code']}` (tap to copy).\n\n"
+                f"Share this code! If {REFERRAL_TARGET_COUNT} friends use your code when starting the bot and then upgrade to any premium plan, "
+                f"you'll receive {REFERRAL_PREMIUM_DURATION_MONTHS} months of premium access for FREE!")
+        update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    else:
+        update.message.reply_text("Could not find your referral code. Please try `/start` again. If the issue persists, contact support.")
+
+
+# --- Conversation Handler for /addchannel ---
+@check_join_channel
+def addchannel_entry(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+
+    # Check channel limits
+    current_channels_count = count_user_linked_channels(user_id)
+    limit = get_user_channel_limit(user_id)
+    if current_channels_count >= limit:
+        update.message.reply_text(
+            f"⚠️ You've reached your limit of {limit} YouTube channels. "
+            "Please /upgrade for more or remove an existing channel via the menu."
+        )
+        return ConversationHandler.END
+
+    if len(context.args) < 2:
+        update.message.reply_text("Usage: `/addchannel <YouTube_Channel_URL> <Target_Telegram_GroupID_or_@ChannelUsername>`\n"
+                                  "Example (public channel): `/addchannel https://youtube.com/channel/YourChannelID @mytelegramchannel`\n"
+                                  "Example (group): `/addchannel https://youtube.com/@Handle -100123456789` (Get group ID from @RawDataBot)")
+        return ConversationHandler.END # Not returning a state, just ending
+
+    yt_url = context.args[0]
+    tg_chat_identifier = context.args[1] # This can be like "@channelname" or "-100xxxxxxxxx"
+
+    update.message.reply_text(f"🔄 Processing YouTube URL: {yt_url}...")
+
+    yt_channel_id = extract_channel_id_from_url(yt_url)
+    if not yt_channel_id:
+        details_from_video, error_vid = get_video_details_from_url(yt_url) # Try if it's a video URL
+        if details_from_video:
+            yt_channel_id = details_from_video['channel_id']
+            logger.info(f"Extracted channel ID {yt_channel_id} from video URL {yt_url}")
+        else:
+            update.message.reply_text(f"❌ Couldn't extract a valid YouTube Channel ID from the URL: {yt_url}. Please provide a direct link to the channel (e.g., .../channel/UCxxx or .../@handle) or a video from the channel.")
+            return ConversationHandler.END
+
+    channel_details, error_msg = get_channel_details(yt_channel_id)
+    if error_msg or not channel_details:
+        update.message.reply_text(f"❌ Error fetching YouTube channel details: {error_msg or 'Channel not found.'}")
+        return ConversationHandler.END
+
+    yt_channel_name = channel_details['snippet']['title']
+    context.user_data['yt_channel_id'] = yt_channel_id
+    context.user_data['yt_channel_name'] = yt_channel_name
+    context.user_data['tg_chat_identifier'] = tg_chat_identifier
+
+    # Validate Telegram Group/Channel ID and Bot Permissions
+    try:
+        target_chat_id_int = int(tg_chat_identifier) # if it's an ID like -100... or a public channel's ID
+    except ValueError: # if it's like "@channelusername"
+        if not tg_chat_identifier.startswith('@'):
+            update.message.reply_text("Invalid Telegram Group/Channel ID. It must be a numeric ID (often starting with -100 for supergroups) or a public channel username (e.g., @mychannel).")
+            return ConversationHandler.END
+        # For @channelusername, Telegram API will resolve it. We store it as is for context.bot.send_message
+        target_chat_id_int = tg_chat_identifier # Keep as string for username
+
+    try:
+        chat = context.bot.get_chat(target_chat_id_int)
+        tg_chat_title = chat.title or chat.username
+        actual_tg_chat_id = chat.id # This will be the numeric ID always
+
+        # Check if bot is admin
+        bot_member = context.bot.get_chat_member(actual_tg_chat_id, context.bot.id)
+        if bot_member.status != 'administrator' or not bot_member.can_post_messages:
+            update.message.reply_text(
+                f"⚠️ I need to be an **admin with 'Post messages' permission** in '{tg_chat_title}' ({actual_tg_chat_id}) to post videos.\n"
+                "Please grant these permissions and try adding the channel again."
+            )
+            return ConversationHandler.END
+
+        # Check group linking limits
+        current_groups_count = count_user_total_linked_groups(user_id)
+        group_limit = get_user_group_limit(user_id)
+        if current_groups_count >= group_limit:
+            update.message.reply_text(
+                f"⚠️ You've reached your limit of {group_limit} linked Telegram groups/channels across all your YouTube channels. "
+                "Please /upgrade for more or unlink some via the menu."
+            )
+            return ConversationHandler.END
+
+        # Proceed with linking
+        yt_channel_db_id = add_or_get_youtube_channel_db_entry(yt_channel_id, yt_channel_name)
+        user_subscription_id = add_user_subscription_to_yt_channel(user_id, yt_channel_db_id)
+
+        if not user_subscription_id:
+             update.message.reply_text(f"Error linking to YouTube channel '{yt_channel_name}'. You might have already linked this channel.")
+             return ConversationHandler.END
+
+        mapping_id = link_user_subscription_to_telegram_group(user_subscription_id, actual_tg_chat_id, tg_chat_title)
+
+        if mapping_id:
+            update.message.reply_text(
+                f"✅ Success! YouTube channel '{yt_channel_name}' is now linked to Telegram chat '{tg_chat_title}'.\n"
+                f"I will start monitoring for new videos. The first check might take about {VIDEO_CHECK_INTERVAL_MINUTES} minutes."
+            )
+        else:
+            update.message.reply_text(
+                f"⚠️ YouTube channel '{yt_channel_name}' is already linked to Telegram chat '{tg_chat_title}' for your account."
+            )
+
+    except Exception as e:
+        logger.error(f"Error during /addchannel processing for target {tg_chat_identifier}: {e}")
+        if "chat not found" in str(e).lower():
+            update.message.reply_text(f"❌ Error: Telegram Group/Channel '{tg_chat_identifier}' not found or I don't have access to it.")
+        elif "bot was kicked" in str(e).lower():
+             update.message.reply_text(f"❌ Error: I was kicked from '{tg_chat_identifier}'. Please add me back as admin.")
+        else:
+            update.message.reply_text(f"❌ An error occurred while trying to link to '{tg_chat_identifier}'. Please ensure the ID/username is correct and I have permissions.")
+    return ConversationHandler.END
+
+
+# --- Conversation Handler for /remindafter ---
+@check_join_channel
+def remindafter_entry(update: Update, context: CallbackContext):
+    if len(context.args) < 2:
+        update.message.reply_text("Usage: `/remindafter <YouTube_Video_URL> <Minutes_Until_Reminder>`\n"
+                                  "Example: `/remindafter https://youtu.be/somevideoID 60`")
+        return ConversationHandler.END # End if not called properly from command
+
+    context.user_data['reminder_video_url'] = context.args[0]
+    try:
+        context.user_data['reminder_minutes'] = int(context.args[1])
+        return process_reminder_details(update, context) # Directly process if args given
+    except ValueError:
+        update.message.reply_text("Invalid number of minutes. Please provide a whole number.")
+        return ConversationHandler.END
+
+
+def process_reminder_details(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    video_url = context.user_data.get('reminder_video_url')
+    minutes_str = context.user_data.get('reminder_minutes_input') # From text input in convo
+    if not minutes_str: # Try from initial /remindafter args
+         minutes_val = context.user_data.get('reminder_minutes')
+
+    try:
+        if minutes_str: minutes_val = int(minutes_str)
+
+        if not (video_url and isinstance(minutes_val, int) and minutes_val > 0):
+            if update.callback_query: update.callback_query.answer("Invalid data for reminder.")
+            else: update.message.reply_text("Something went wrong. Invalid video URL or minutes.")
+            return ConversationHandler.END
+
+        video_info, error = get_video_details_from_url(video_url)
+        if error or not video_info:
+            message_to_send = f"❌ Could not get details for video: {video_url}. Error: {error or 'Video not found.'}"
+            if update.callback_query:
+                update.callback_query.edit_message_text(message_to_send)
+            else:
+                update.message.reply_text(message_to_send)
+            return ConversationHandler.END
+
+        remind_at = datetime.now(timezone.utc) + timedelta(minutes=minutes_val)
+        add_reminder(user_id, video_url, video_info['title'], remind_at)
+
+        success_message = (
+            f"🔔 Reminder set for '{video_info['title']}'!\n"
+            f"I'll remind you in {minutes_val} minutes (at approximately {remind_at.strftime('%Y-%m-%d %H:%M UTC')})."
+        )
+        if update.callback_query:
+            update.callback_query.edit_message_text(success_message, reply_markup=main_menu_keyboard(user_id))
+        else:
+            update.message.reply_text(success_message, reply_markup=main_menu_keyboard(user_id))
+        return ConversationHandler.END
+
+    except ValueError:
+        if update.callback_query:
+            update.callback_query.answer("Invalid input for minutes.", show_alert=True)
+            # Optionally re-ask for minutes:
+            # update.callback_query.edit_message_text("Please enter the number of minutes (e.g., 60):")
+            # return ASK_REMINDER_MINUTES
+        else:
+            update.message.reply_text("Invalid number of minutes. Please provide a whole number (e.g., 60).")
+        return ASK_REMINDER_MINUTES # Stay in this state if text input was bad
+
+    except Exception as e:
+        logger.error(f"Error processing reminder: {e}")
+        error_msg = "An unexpected error occurred while setting the reminder."
+        if update.callback_query: update.callback_query.edit_message_text(error_msg)
+        else: update.message.reply_text(error_msg)
+        return ConversationHandler.END
+
+
+def ask_reminder_video_url(update: Update, context: CallbackContext): # From callback CB_SCHEDULE_REMINDER_VIDEO_URL
+    query = update.callback_query
+    query.answer()
+    query.edit_message_text("Okay, please send me the YouTube video URL you want to set a reminder for:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_BACK_TO_MAIN)]]))
+    return ASK_REMINDER_URL
+
+def received_reminder_url(update: Update, context: CallbackContext): # Text input for URL
+    context.user_data['reminder_video_url'] = update.message.text
+    update.message.reply_text("Great! Now, in how many minutes from now should I remind you? (e.g., 60)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_BACK_TO_MAIN)]]))
+    return ASK_REMINDER_MINUTES
+
+def received_reminder_minutes(update: Update, context: CallbackContext): # Text input for minutes
+    context.user_data['reminder_minutes_input'] = update.message.text
+    return process_reminder_details(update, context) # Process with the new text input
+
+def cancel_conversation(update: Update, context: CallbackContext):
+    message = "Operation cancelled."
+    if update.callback_query:
+        query = update.callback_query
+        query.answer()
+        query.edit_message_text(text=f"{message}\nReturning to main menu.", reply_markup=main_menu_keyboard(update.effective_user.id))
+    else:
+        update.message.reply_text(text=f"{message}\nReturning to main menu.", reply_markup=main_menu_keyboard(update.effective_user.id))
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# --- /list command (now handled by callback CB_CHECK_CHANNELS mostly) ---
+@check_join_channel
+def list_command(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    channels = get_user_subscribed_yt_channels(user_id)
+    if not channels:
+        update.message.reply_text("You haven't linked any YouTube channels yet. Use `/addchannel` or the menu options.", reply_markup=main_menu_keyboard(user_id))
+        return
+
+    text = "🔗 **Your Linked YouTube Channels:**\n\n"
+    for i, ch_data in enumerate(channels):
+        text += f"{i+1}. **{ch_data['youtube_channel_name']}** (`{ch_data['yt_channel_id_str']}`)\n"
+        linked_groups = get_linked_telegram_groups_for_user_subscription(ch_data['user_subscription_id'])
+        if linked_groups:
+            text += "   ▻ Posting to: " + ", ".join([lg['telegram_chat_title'] or str(lg['telegram_chat_id']) for lg in linked_groups]) + "\n"
+        else:
+            text += "   ▻ Not currently posting to any Telegram group/channel.\n"
+        text += "\n"
+
+    text += "\nUse the inline keyboard buttons from `/start` or the menu to manage these connections in more detail."
+    update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard(user_id))
+
+# --- /upgrade command (now handled by callback CB_UPGRADE_OPTIONS) ---
+@check_join_channel
+def upgrade_command(update: Update, context: CallbackContext): # Handles /upgrade command
+    user_id = update.effective_user.id
+    user_status = get_user(user_id)
+    text = "🚀 **Upgrade to Premium**\n\nUnlock more power with our premium plans:\n"
+    text += f"🔹 **{PREMIUM_PLAN_1_NAME}**: ₹{PREMIUM_PLAN_1_PRICE/100:.2f}/month for {PREMIUM_PLAN_1_YT_CHANNELS} YouTube channels.\n"
+    text += f"🔹 **{PREMIUM_PLAN_2_NAME}**: ₹{PREMIUM_PLAN_2_PRICE/100:.2f}/3 months for {PREMIUM_PLAN_2_YT_CHANNELS} YouTube channels (discounted!).\n\n"
+
+    if user_status and user_status['is_premium'] and user_status['premium_expiry_date']:
+        expiry_str = user_status['premium_expiry_date'].strftime('%Y-%m-%d %H:%M UTC')
+        text += f"You are currently on a premium plan, expiring on {expiry_str}.\n"
+    else:
+        text += "You are currently on the Free tier.\n"
+
+    text += "Select a plan below to proceed with payment (simulated in Colab):"
+    update.message.reply_text(text, reply_markup=upgrade_options_keyboard())
+
+# --- Admin Command (/admin) ---
+@check_join_channel
+def admin_command(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_TELEGRAM_ID:
+        update.message.reply_text("You are not authorized to use this command.", reply_markup=main_menu_keyboard(user_id))
+        return
+    update.message.reply_text("👑 Welcome to the Admin Panel!", reply_markup=admin_main_keyboard())
+
+# Admin command for simulating payment (COLAB SPECIFIC for testing)
+@check_join_channel
+def simulate_payment_command(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_TELEGRAM_ID:
+        update.message.reply_text("Unauthorized.")
+        return
+
+    if len(context.args) != 3:
+        update.message.reply_text("Usage: `/simpayment <target_user_id> <plan_id> <amount_paisa>`\n"
+                                  "Plan IDs: `plan_premium_1`, `plan_premium_3m`")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+        plan_id_arg = context.args[1]
+        amount_paisa_arg = int(context.args[2])
+
+        target_user = get_user(target_user_id)
+        if not target_user:
+            update.message.reply_text(f"User {target_user_id} not found.")
+            return
+
+        if plan_id_arg not in [PREMIUM_PLAN_1_ID, PREMIUM_PLAN_2_ID]:
+            update.message.reply_text(f"Invalid Plan ID. Use '{PREMIUM_PLAN_1_ID}' or '{PREMIUM_PLAN_2_ID}'.")
+            return
+
+        # Simulate a payment ID and order ID
+        mock_payment_id = f"sim_pay_{int(time.time())}"
+        mock_order_id = f"sim_order_{int(time.time())}"
+
+        success, message = handle_successful_payment(target_user_id, mock_payment_id, mock_order_id, plan_id_arg, amount_paisa_arg)
+
+        if success:
+            update.message.reply_text(f"Simulated payment processed for user {target_user_id}.\n{message}")
+            context.bot.send_message(target_user_id, f"🎉 Your admin has upgraded your account! You are now on premium.\n{message}")
+        else:
+            update.message.reply_text(f"Simulated payment FAILED for user {target_user_id}.\n{message}")
+
+    except ValueError:
+        update.message.reply_text("Invalid User ID or Amount. They must be numbers.")
+    except Exception as e:
+        logger.error(f"Error in /simpayment: {e}")
+        update.message.reply_text(f"An error occurred: {e}")
+
+
+# --- Admin Conversation Handlers (Manual Upgrade/Downgrade) ---
+def admin_ask_user_id_for_upgrade(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    query.edit_message_text("Enter the Telegram User ID to upgrade:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_ADMIN_MAIN)]]))
+    return ASK_USER_ID_FOR_UPGRADE
+
+def admin_received_user_id_for_upgrade(update: Update, context: CallbackContext):
+    try:
+        user_id_to_upgrade = int(update.message.text)
+        user_exists = get_user(user_id_to_upgrade)
+        if not user_exists:
+            update.message.reply_text(f"User with ID {user_id_to_upgrade} not found in the database. Please ensure they have started the bot.", reply_markup=admin_main_keyboard())
+            return ConversationHandler.END
+        context.user_data['admin_target_user_id'] = user_id_to_upgrade
+        update.message.reply_text(f"Upgrading user {user_id_to_upgrade} ({user_exists['username'] or user_exists['first_name']}).\n"
+                                  "For how many months should their premium be active? (e.g., 1, 3, 12)")
+        return ASK_MONTHS_FOR_UPGRADE
+    except ValueError:
+        update.message.reply_text("Invalid User ID. Please enter a numeric ID.", reply_markup=admin_main_keyboard())
+        return ConversationHandler.END # Or ASK_USER_ID_FOR_UPGRADE to retry
+
+def admin_received_months_for_upgrade(update: Update, context: CallbackContext):
+    try:
+        months = int(update.message.text)
+        user_id_to_upgrade = context.user_data['admin_target_user_id']
+        if months <= 0:
+            update.message.reply_text("Months must be a positive number.")
+            return ASK_MONTHS_FOR_UPGRADE
+
+        success = set_user_premium_status(user_id_to_upgrade, "ADMIN_GRANT", months, 0) # 0 amount for admin grant
+        if success:
+            update.message.reply_text(f"User {user_id_to_upgrade} has been upgraded for {months} months.", reply_markup=admin_main_keyboard())
+            try:
+                context.bot.send_message(user_id_to_upgrade, f"🎉 Admin has granted you {months} months of premium access!")
+            except Exception: pass # Ignore if bot can't message user
+        else:
+            update.message.reply_text(f"Failed to upgrade user {user_id_to_upgrade}.", reply_markup=admin_main_keyboard())
+        context.user_data.clear()
+        return ConversationHandler.END
+    except ValueError:
+        update.message.reply_text("Invalid number of months. Please enter a number.")
+        return ASK_MONTHS_FOR_UPGRADE
+
+def admin_ask_user_id_for_downgrade(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    query.edit_message_text("Enter the Telegram User ID to downgrade (remove premium):", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=CB_ADMIN_MAIN)]]))
+    return ASK_USER_ID_FOR_DOWNGRADE
+
+def admin_received_user_id_for_downgrade(update: Update, context: CallbackContext):
+    try:
+        user_id_to_downgrade = int(update.message.text)
+        user = get_user(user_id_to_downgrade)
+        if not user:
+            update.message.reply_text(f"User {user_id_to_downgrade} not found.", reply_markup=admin_main_keyboard())
+            return ConversationHandler.END
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET is_premium = FALSE, premium_expiry_date = NULL WHERE user_id = ?", (user_id_to_downgrade,))
+        conn.commit()
+        conn.close()
+        remove_premium_user_from_sheet(user_id_to_downgrade) # Sync with sheets
+        update.message.reply_text(f"User {user_id_to_downgrade} has been manually downgraded to the free tier.", reply_markup=admin_main_keyboard())
+        try:
+            context.bot.send_message(user_id_to_downgrade, "Your premium access has been ended by an admin. You are now on the free tier.")
+        except Exception: pass
+        return ConversationHandler.END
+    except ValueError:
+        update.message.reply_text("Invalid User ID format.")
+        return ASK_USER_ID_FOR_DOWNGRADE
+
+
+# --- Callback Query Handlers (Inline Buttons) ---
+@check_join_channel # Most callbacks should also check this, or rely on the initial command
+def callback_query_handler(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+
+    query.answer() # Acknowledge callback
+
+    # --- Main Menu Navigation ---
+    if data == CB_BACK_TO_MAIN:
+        query.edit_message_text("🏡 Main Menu:", reply_markup=main_menu_keyboard(user_id))
+
+    elif data == "cb_help": # Help button from menu
+        help_text = "..." # Simplified, copy full help text or call help_command logic
+        query.edit_message_text("Here are some common commands and tips...\nUse /help for a full list.", reply_markup=main_menu_keyboard(user_id))
+
+    elif data == "cb_my_referral_code":
+        user = get_user(user_id)
+        if user and user['referral_code']:
+            text = (f"Your personal referral code is: `{user['referral_code']}` (tap to copy).\n\n"
+                    f"Share this code! If {REFERRAL_TARGET_COUNT} friends use your code and then upgrade to premium, "
+                    f"you'll get {REFERRAL_PREMIUM_DURATION_MONTHS} months of premium FREE!")
+            query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard(user_id))
+        else:
+            query.edit_message_text("Could not find your referral code.", reply_markup=main_menu_keyboard(user_id))
+
+    # --- Channel Management Callbacks ---
+    elif data == CB_CHECK_CHANNELS:
+        query.edit_message_text("Your Linked YouTube Channels:", reply_markup=user_channels_keyboard(user_id))
+
+    elif data.startswith(CB_VIEW_CHANNEL_DETAILS_PREFIX):
+        user_subscription_id = int(data.split('_')[-1])
+        # Fetch channel name using user_subscription_id
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT yc.youtube_channel_name
+            FROM user_youtube_subscriptions uys
+            JOIN youtube_channels yc ON uys.yt_channel_db_id = yc.id
+            WHERE uys.id = ? AND uys.user_id = ?
+        ''', (user_subscription_id, user_id))
+        channel_row = cursor.fetchone()
+        conn.close()
+        if channel_row:
+            channel_name = channel_row['youtube_channel_name']
+            text = f"Managing **{channel_name}**.\nWhat would you like to do?"
+            query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=channel_details_keyboard(user_subscription_id, channel_name))
+        else:
+            query.edit_message_text("Channel not found or access denied.", reply_markup=user_channels_keyboard(user_id))
+
+    elif data.startswith(CB_DELETE_CHANNEL_CONFIRM_PREFIX):
+        user_subscription_id = int(data.split('_')[-1])
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT yc.youtube_channel_name FROM user_youtube_subscriptions uys JOIN youtube_channels yc ON uys.yt_channel_db_id = yc.id WHERE uys.id = ? AND uys.user_id = ?", (user_subscription_id, user_id))
+        ch = cursor.fetchone()
+        conn.close()
+        if ch:
+            query.edit_message_text(f"Are you sure you want to unlink '{ch['youtube_channel_name']}' and stop receiving its video updates?",
+                                    reply_markup=confirm_delete_channel_keyboard(user_subscription_id, ch['youtube_channel_name']))
+        else:
+            query.edit_message_text("Error: Channel not found.", reply_markup=user_channels_keyboard(user_id))
+
+    elif data.startswith(CB_DELETE_CHANNEL_DO_PREFIX):
+        user_subscription_id = int(data.split('_')[-1])
+        # Ensure this subscription belongs to the user - implicit by how we got here from user's list.
+        # Perform deletion from DB
+        if remove_user_yt_channel_subscription(user_subscription_id):
+            query.edit_message_text("Channel unlinked successfully.", reply_markup=user_channels_keyboard(user_id))
+        else:
+            query.edit_message_text("Error unlinking channel.", reply_markup=user_channels_keyboard(user_id))
+
+    elif data.startswith(CB_MANAGE_LINKED_GROUPS_PREFIX):
+        user_subscription_id = int(data.split('_')[-1])
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT yc.youtube_channel_name FROM user_youtube_subscriptions uys JOIN youtube_channels yc ON uys.yt_channel_db_id = yc.id WHERE uys.id = ? AND uys.user_id = ?", (user_subscription_id, user_id))
+        ch = cursor.fetchone()
+        conn.close()
+        if ch:
+            query.edit_message_text(f"Managing Telegram Groups for YT Channel: **{ch['youtube_channel_name']}**",
+                                    parse_mode=ParseMode.MARKDOWN,
+                                    reply_markup=manage_linked_groups_keyboard(user_subscription_id, ch['youtube_channel_name']))
+        else:
+             query.edit_message_text("Error: Channel not found.", reply_markup=user_channels_keyboard(user_id))
+
+    elif data.startswith(CB_UNLINK_GROUP_PREFIX):
+        mapping_id = int(data.split('_')[-1])
+        # Get user_subscription_id from mapping_id to return to correct channel detail view
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT cgm.user_subscription_id, yc.youtube_channel_name FROM channel_group_mappings cgm JOIN user_youtube_subscriptions uys ON cgm.user_subscription_id = uys.id JOIN youtube_channels yc ON uys.yt_channel_db_id = yc.id WHERE cgm.id = ? AND uys.user_id = ?", (mapping_id, user_id))
+        res = cursor.fetchone()
+        conn.close()
+        if res:
+            user_subscription_id = res['user_subscription_id']
+            yt_channel_name = res['youtube_channel_name']
+            if unlink_telegram_group_from_subscription(mapping_id):
+                query.edit_message_text("Telegram group unlinked successfully.", reply_markup=manage_linked_groups_keyboard(user_subscription_id, yt_channel_name))
+            else:
+                query.edit_message_text("Error unlinking group.", reply_markup=manage_linked_groups_keyboard(user_subscription_id, yt_channel_name))
+        else:
+            query.edit_message_text("Error: Mapping not found or unauthorized.", reply_markup=main_menu_keyboard(user_id))
+
+
+    # --- Upgrade Plan Callbacks ---
+    elif data == CB_UPGRADE_OPTIONS:
+        user_status = get_user(user_id)
+        text = "🚀 **Upgrade to Premium**\n\nUnlock more power with our premium plans:\n"
+        text += f"🔹 **{PREMIUM_PLAN_1_NAME}**: ₹{PREMIUM_PLAN_1_PRICE/100:.2f}/month for {PREMIUM_PLAN_1_YT_CHANNELS} YouTube channels.\n"
+        text += f"🔹 **{PREMIUM_PLAN_2_NAME}**: ₹{PREMIUM_PLAN_2_PRICE/100:.2f}/3 months for {PREMIUM_PLAN_2_YT_CHANNELS} YouTube channels (discounted!).\n\n"
+
+        if user_status and user_status['is_premium'] and user_status['premium_expiry_date']:
+            expiry_str = user_status['premium_expiry_date'].strftime('%Y-%m-%d %H:%M UTC')
+            text += f"You are currently on a premium plan, expiring on {expiry_str}.\n"
+        else:
+            text += "You are currently on the Free tier.\n"
+        text += "Select a plan below to proceed (payment gateway integration would be here):"
+        query.edit_message_text(text, reply_markup=upgrade_options_keyboard())
+
+    elif data == CB_UPGRADE_PLAN_1 or data == CB_UPGRADE_PLAN_2:
+        plan_id = PREMIUM_PLAN_1_ID if data == CB_UPGRADE_PLAN_1 else PREMIUM_PLAN_2_ID
+        amount = PREMIUM_PLAN_1_PRICE if data == CB_UPGRADE_PLAN_1 else PREMIUM_PLAN_2_PRICE
+        plan_name = PREMIUM_PLAN_1_NAME if data == CB_UPGRADE_PLAN_1 else PREMIUM_PLAN_2_NAME
+
+        if not razorpay_client:
+            query.edit_message_text("Payment system is currently unavailable. Please contact admin.", reply_markup=upgrade_options_keyboard())
+            return
+
+        order, error = create_razorpay_order(amount)
+        if error or not order:
+            query.edit_message_text(f"Could not create payment order: {error or 'Unknown error'}. Please try again later.", reply_markup=upgrade_options_keyboard())
+            return
+
+        # In real scenario, you provide a payment link. For Colab, we mock this.
+        # The user would pay, then Razorpay hits your webhook.
+        # Webhook handling is not directly feasible in Colab.
+        # So, we inform about the (mock) order.
+        text = (
+            f"You selected: **{plan_name}** (₹{amount/100:.2f}).\n"
+            f"A Razorpay order (ID: `{order['id']}`) has been notionally created.\n\n"
+            "**For this Colab demo:**\n"
+            "To simulate successful payment, an admin can use:\n"
+            f"`/simpayment {user_id} {plan_id} {amount}`\n\n"
+            "In a live bot, you would be redirected to Razorpay to complete the payment."
+        )
+        query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=upgrade_options_keyboard())
+
+    # --- Admin Panel Callbacks ---
+    elif data == CB_ADMIN_MAIN:
+        if user_id != ADMIN_TELEGRAM_ID:
+            query.edit_message_text("Access denied.", reply_markup=main_menu_keyboard(user_id))
+            return
+        query.edit_message_text("👑 Admin Panel:", reply_markup=admin_main_keyboard())
+
+    elif data == CB_ADMIN_VIEW_USERS:
+        if user_id != ADMIN_TELEGRAM_ID: query.answer("Unauthorized"); return
+        users = get_all_users_data_for_admin()
+        if not users:
+            query.edit_message_text("No users found yet.", reply_markup=admin_main_keyboard())
+            return
+        text = "👥 **All Bot Users:**\n\n"
+        for u in users:
+            expiry = u['premium_expiry_date'].strftime('%Y-%m-%d') if u['premium_expiry_date'] else 'N/A'
+            premium_status = "👑 Premium" if u['is_premium'] and (not u['premium_expiry_date'] or u['premium_expiry_date'] > datetime.now(timezone.utc)) else "🆓 Free"
+            text += (f"👤 ID: `{u['user_id']}`\n"
+                     f"   Username: @{u['username'] or 'N/A'}\n"
+                     f"   Name: {u['first_name'] or 'N/A'}\n"
+                     f"   Status: {premium_status} (Expires: {expiry})\n"
+                     f"   Joined: {u['join_date'].strftime('%Y-%m-%d')}\n\n")
+            if len(text) > 3800: # Telegram message limit
+                query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN) # Send current chunk
+                text = "" # Reset for next chunk
+        if text: query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_main_keyboard()) # Send remaining
+
+    elif data == CB_ADMIN_VIEW_CONNECTIONS:
+        if user_id != ADMIN_TELEGRAM_ID: query.answer("Unauthorized"); return
+        conns = get_all_connections_for_admin()
+        if not conns:
+            query.edit_message_text("No active connections found.", reply_markup=admin_main_keyboard())
+            return
+        text = "🔗 **All Active Connections:**\n\n"
+        for c in conns:
+            tg_chat = c['telegram_chat_title'] or str(c['telegram_chat_id'])
+            text += (f"👤 User: `{c['user_id']}` (@{c['username'] or 'N/A'})\n"
+                     f"   📺 YT Channel: {c['youtube_channel_name']} (`{c['youtube_channel_id']}`)\n"
+                     f"   🔗 TG Chat: {tg_chat} (`{c['telegram_chat_id']}`)\n\n")
+            if len(text) > 3800:
+                query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+                text = ""
+        if text: query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_main_keyboard())
+
+    else:
+        # Fallback for unhandled callbacks, good for debugging
+        logger.warning(f"Unhandled callback query data: {data}")
+        query.answer("This button doesn't have a function yet or is part of a conversation flow.")
+
+
+# --- Conversation handler for adding a group to a channel via inline buttons ---
+def ask_group_id_for_linking_entry(update: Update, context: CallbackContext): # Triggered by CB_ADD_GROUP_TO_CHANNEL_PREFIX
+    query = update.callback_query
+    user_id = query.from_user.id
+    user_subscription_id = int(query.data.split('_')[-1])
+
+    # Verify group limit before asking
+    current_groups_count = count_user_total_linked_groups(user_id)
+    group_limit = get_user_group_limit(user_id)
+    if current_groups_count >= group_limit:
+        query.answer(f"You've reached your group link limit ({group_limit}). Upgrade or remove others.", show_alert=True)
+        return ConversationHandler.END
+
+    context.user_data['user_subscription_id_for_group_add'] = user_subscription_id
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT yc.youtube_channel_name FROM user_youtube_subscriptions uys JOIN youtube_channels yc ON uys.yt_channel_db_id = yc.id WHERE uys.id = ? AND uys.user_id = ?", (user_subscription_id, user_id))
+    ch_row = cursor.fetchone()
+    conn.close()
+
+    if not ch_row:
+        query.answer("Channel not found.", show_alert=True)
+        return ConversationHandler.END
+
+    channel_name = ch_row['youtube_channel_name']
+    query.answer()
+    query.edit_message_text(
+        f"Okay, you want to link a new Telegram group/channel to **{channel_name}**.\n\n"
+        "Please send me the **Target Telegram Group ID** (e.g., -100xxxx) or **Public Channel Username** (e.g., @mychannel).\n\n"
+        "ℹ️ *Make sure I am an admin in that group/channel with permission to post messages!*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[back_button(f"{CB_VIEW_CHANNEL_DETAILS_PREFIX}{user_subscription_id}")]])) # Back to prev menu
+    return ASK_GROUP_ID_FOR_LINKING
+
+def received_group_id_for_linking(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    tg_chat_identifier = update.message.text
+    user_subscription_id = context.user_data.get('user_subscription_id_for_group_add')
+
+    if not user_subscription_id: # Should not happen if flow is correct
+        update.message.reply_text("Error: Context lost. Please try again from channel details.", reply_markup=main_menu_keyboard(user_id))
+        return ConversationHandler.END
+
+    conn_s = get_db_connection()
+    cursor_s = conn_s.cursor()
+    cursor_s.execute("SELECT yc.youtube_channel_name FROM user_youtube_subscriptions uys JOIN youtube_channels yc ON uys.yt_channel_db_id = yc.id WHERE uys.id = ? AND uys.user_id = ?", (user_subscription_id, user_id))
+    ch_data = cursor_s.fetchone()
+    conn_s.close()
+
+    if not ch_data:
+        update.message.reply_text("Original YouTube channel link not found. Please retry.", reply_markup=main_menu_keyboard(user_id))
+        return ConversationHandler.END
+    yt_channel_name_for_display = ch_data['youtube_channel_name']
+
+
+    try:
+        target_chat_id_int = int(tg_chat_identifier)
+    except ValueError:
+        if not tg_chat_identifier.startswith('@'):
+            update.message.reply_text("Invalid Telegram Group/Channel ID/Username. Try again or cancel.",
+                                      reply_markup=InlineKeyboardMarkup([[back_button(f"{CB_VIEW_CHANNEL_DETAILS_PREFIX}{user_subscription_id}")]]))
+            return ASK_GROUP_ID_FOR_LINKING # Stay in state
+        target_chat_id_int = tg_chat_identifier
+
+    try:
+        chat = context.bot.get_chat(target_chat_id_int)
+        tg_chat_title = chat.title or chat.username
+        actual_tg_chat_id = chat.id
+
+        bot_member = context.bot.get_chat_member(actual_tg_chat_id, context.bot.id)
+        if bot_member.status != 'administrator' or not bot_member.can_post_messages:
+            update.message.reply_text(
+                f"⚠️ I need to be an admin with 'Post messages' permission in '{tg_chat_title}' ({actual_tg_chat_id}). Grant permissions and try again.",
+                 reply_markup=InlineKeyboardMarkup([[back_button(f"{CB_VIEW_CHANNEL_DETAILS_PREFIX}{user_subscription_id}")]]))
+            return ASK_GROUP_ID_FOR_LINKING # Stay in state
+
+        mapping_id = link_user_subscription_to_telegram_group(user_subscription_id, actual_tg_chat_id, tg_chat_title)
+        if mapping_id:
+            update.message.reply_text(f"✅ Success! YouTube channel '{yt_channel_name_for_display}' is now also linked to Telegram chat '{tg_chat_title}'.",
+                                       reply_markup=channel_details_keyboard(user_subscription_id, yt_channel_name_for_display))
+        else:
+            update.message.reply_text(f"⚠️ This YouTube channel is already linked to Telegram chat '{tg_chat_title}'.",
+                                       reply_markup=channel_details_keyboard(user_subscription_id, yt_channel_name_for_display))
+        context.user_data.clear()
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Error linking group via inline button flow for target {tg_chat_identifier}: {e}")
+        if "chat not found" in str(e).lower():
+            update.message.reply_text(f"❌ Error: Telegram Group/Channel '{tg_chat_identifier}' not found or I don't have access to it. Try again or cancel.",
+                                       reply_markup=InlineKeyboardMarkup([[back_button(f"{CB_VIEW_CHANNEL_DETAILS_PREFIX}{user_subscription_id}")]]))
+        else:
+            update.message.reply_text(f"❌ An error occurred. Try again or cancel.",
+                                       reply_markup=InlineKeyboardMarkup([[back_button(f"{CB_VIEW_CHANNEL_DETAILS_PREFIX}{user_subscription_id}")]]))
+        return ASK_GROUP_ID_FOR_LINKING # Stay in state
+
+
+def cancel_add_group_conversation(update: Update, context: CallbackContext): # Handles cancel from inline kbd within convo
+    query = update.callback_query
+    user_id = query.from_user.id
+    user_subscription_id = context.user_data.get('user_subscription_id_for_group_add')
+    query.answer()
+
+    if user_subscription_id:
+        # Fetch channel name to make the menu contextually correct
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT yc.youtube_channel_name FROM user_youtube_subscriptions uys JOIN youtube_channels yc ON uys.yt_channel_db_id = yc.id WHERE uys.id = ? AND uys.user_id = ?", (user_subscription_id, user_id))
+        ch_row = cursor.fetchone()
+        conn.close()
+        channel_name = ch_row['youtube_channel_name'] if ch_row else "Channel"
+        query.edit_message_text(f"Cancelled adding group. Returning to options for **{channel_name}**.", parse_mode=ParseMode.MARKDOWN, reply_markup=channel_details_keyboard(user_subscription_id, channel_name))
+    else: # Should not happen but fallback
+        query.edit_message_text("Operation cancelled. Returning to main menu.", reply_markup=main_menu_keyboard(user_id))
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ==============================================================================
+# SCHEDULER TASKS (`scheduler_tasks.py` content)
+# ==============================================================================
+
+# --- YouTube Video Checking Job (using JobQueue from PTB) ---
+def check_new_videos_job(context: CallbackContext):
+    logger.info("Running job: check_new_videos_job")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Get all distinct YouTube channels that are actively linked by users
+    cursor.execute('''
+        SELECT DISTINCT
+            yc.id as yt_channel_db_id,
+            yc.youtube_channel_id,
+            yc.youtube_channel_name,
+            yc.last_fetched_video_id
+        FROM youtube_channels yc
+        JOIN user_youtube_subscriptions uys ON yc.id = uys.yt_channel_db_id
+        JOIN channel_group_mappings cgm ON uys.id = cgm.user_subscription_id
+        WHERE cgm.is_active = TRUE
+    ''')
+    active_yt_channels = cursor.fetchall()
+    youtube_service = get_youtube_service()
+    if not youtube_service:
+        logger.error("YouTube service not available for video check job.")
+        conn.close()
+        return
+
+    for yt_channel_row in active_yt_channels:
+        yt_channel_db_id = yt_channel_row['yt_channel_db_id']
+        yt_channel_api_id = yt_channel_row['youtube_channel_id']
+        yt_channel_name = yt_channel_row['youtube_channel_name']
+        last_known_video_id = yt_channel_row['last_fetched_video_id']
+        logger.debug(f"Checking channel: {yt_channel_name} ({yt_channel_api_id}), last video: {last_known_video_id}")
+
+        try:
+            # Fetch latest ~5 videos. API returns newest first.
+            # We don't use publishedAfter here; we use last_known_video_id logic
+            latest_videos, error_msg = get_latest_videos_from_channel(yt_channel_api_id, count=5)
+            if error_msg:
+                logger.error(f"Failed to fetch videos for {yt_channel_name}: {error_msg}")
+                if "quotaExceeded" in error_msg or "quota" in error_msg.lower():
+                     logger.critical("YOUTUBE API QUOTA EXCEEDED. Bot functionality will be impaired.")
+                     # Consider stopping checks for a while or notifying admin
+                continue
+
+            if not latest_videos:
+                logger.debug(f"No videos found for {yt_channel_name} in this check.")
+                continue
+
+            new_videos_to_post = []
+            current_newest_video_id_for_channel = last_known_video_id
+
+            for video in reversed(latest_videos): # Process oldest of the batch first
+                if video['id'] == last_known_video_id: # We found the last processed one
+                    break # All videos after this (in original newest-first list) are new
+                new_videos_to_post.append(video)
+
+            if new_videos_to_post: # Found videos newer than last_known_video_id
+                logger.info(f"Found {len(new_videos_to_post)} new video(s) for {yt_channel_name}.")
+                
+                # Post these new videos and update last_fetched_video_id
+                for video_to_post in new_videos_to_post: # Already in chronological order
+                    post_new_video_to_linked_chats(context, yt_channel_db_id, video_to_post)
+                    current_newest_video_id_for_channel = video_to_post['id'] # Update to the latest one posted
+            
+            # Update last_fetched_video_id to the ID of the newest video from this fetch,
+            # even if no new videos were *posted*. This helps in case of gaps or re-uploads.
+            # But if new_videos_to_post is not empty, current_newest_video_id_for_channel is already updated.
+            # If it is empty, means the latest video from API is still the one we have, or older.
+            if not new_videos_to_post and latest_videos and last_known_video_id != latest_videos[0]['id']:
+                 # If latest video in API is different but not "newer" by our logic, still update.
+                 # This can happen if an old video was deleted and a new one takes its place as "latest" in API.
+                 current_newest_video_id_for_channel = latest_videos[0]['id']
+            elif not last_known_video_id and latest_videos: # First time check for this channel
+                 current_newest_video_id_for_channel = latest_videos[0]['id']
+
+
+            if current_newest_video_id_for_channel != last_known_video_id:
+                 cursor.execute(
+                    "UPDATE youtube_channels SET last_fetched_video_id = ?, last_checked = CURRENT_TIMESTAMP WHERE id = ?",
+                    (current_newest_video_id_for_channel, yt_channel_db_id)
+                 )
+                 conn.commit()
+                 logger.debug(f"Updated last_fetched_video_id for {yt_channel_name} to {current_newest_video_id_for_channel}")
+            else: # No new videos, just update last_checked
+                 cursor.execute("UPDATE youtube_channels SET last_checked = CURRENT_TIMESTAMP WHERE id = ?", (yt_channel_db_id,))
+                 conn.commit()
+
+        except Exception as e:
+            logger.error(f"Unhandled error processing channel {yt_channel_name} ({yt_channel_api_id}): {e}", exc_info=True)
+        
+        time.sleep(1) # Small delay between API calls to be polite / avoid rapid fire rate limit
+
+    conn.close()
+
+
+def post_new_video_to_linked_chats(context: CallbackContext, yt_channel_db_id, video_data):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Find all Telegram chats linked to this YouTube channel (via user_subscriptions)
+    cursor.execute('''
+        SELECT DISTINCT cgm.telegram_chat_id
+        FROM channel_group_mappings cgm
+        JOIN user_youtube_subscriptions uys ON cgm.user_subscription_id = uys.id
+        WHERE uys.yt_channel_db_id = ? AND cgm.is_active = TRUE
+    ''', (yt_channel_db_id,))
+    linked_chats = cursor.fetchall()
+    conn.close()
+
+    if not linked_chats:
+        logger.debug(f"No active Telegram chats linked for YT channel db_id {yt_channel_db_id} to post video {video_data['id']}")
+        return
+
+    video_url = f"https://www.youtube.com/watch?v={video_data['id']}"
+    message_text = (
+        f"📢 New Video Published: **{video_data['title']}**\n\n"
+        # f"{video_data['description']}\n\n" # Description can be long
+        f"Watch now: {video_url}"
+    )
+
+    for chat_row in linked_chats:
+        tg_chat_id = chat_row['telegram_chat_id']
+        try:
+            context.bot.send_message(
+                chat_id=tg_chat_id,
+                text=message_text,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=False
+            )
+            logger.info(f"Posted video '{video_data['title']}' to chat {tg_chat_id}")
+        except Exception as e:
+            logger.error(f"Failed to send video {video_data['id']} to chat {tg_chat_id}: {e}")
+            # Could handle specific errors like "bot was kicked", "chat not found"
+            # and deactivate the mapping (cgm.is_active = FALSE)
+            if "bot was kicked" in str(e).lower() or "chat not found" in str(e).lower() or "Forbidden: bot is not a member" in str(e).lower():
+                logger.warning(f"Bot cannot access chat {tg_chat_id}. Deactivating mapping for this channel.")
+                # This requires knowing the mapping_id or user_subscription_id + tg_chat_id
+                # Deactivation logic needs to be robust here. For simplicity, just logging.
+                # A better approach would be:
+                # conn_update = get_db_connection()
+                # cur_update = conn_update.cursor()
+                # cur_update.execute("""UPDATE channel_group_mappings SET is_active = FALSE
+                #                       WHERE telegram_chat_id = ? AND user_subscription_id IN
+                #                       (SELECT id FROM user_youtube_subscriptions WHERE yt_channel_db_id = ?)""",
+                #                       (tg_chat_id, yt_channel_db_id))
+                # conn_update.commit()
+                # conn_update.close()
+        time.sleep(0.5) # Rate limit posting
+
+
+# --- Reminder Sending Job (using JobQueue) ---
+def send_due_reminders_job(context: CallbackContext):
+    logger.debug("Running job: send_due_reminders_job")
+    due_reminders = get_due_reminders()
+    if not due_reminders:
+        return
+
+    logger.info(f"Found {len(due_reminders)} due reminders to send.")
+    for reminder in due_reminders:
+        message = (
+            f"🔔 **Friendly Reminder!**\n\n"
+            f"You asked to be reminded about this video:\n"
+            f"🎬 **{reminder['video_title']}**\n"
+            f"{reminder['youtube_video_url']}"
+        )
+        try:
+            context.bot.send_message(
+                chat_id=reminder['user_id'],
+                text=message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            mark_reminder_sent(reminder['id'])
+            logger.info(f"Sent reminder ID {reminder['id']} for video '{reminder['video_title']}' to user {reminder['user_id']}")
+        except Exception as e:
+            logger.error(f"Failed to send reminder ID {reminder['id']} to user {reminder['user_id']}: {e}")
+            if "bot was blocked by the user" in str(e).lower() or "user is deactivated" in str(e).lower():
+                logger.warning(f"User {reminder['user_id']} blocked the bot or is deactivated. Marking reminder {reminder['id']} as sent to prevent retries.")
+                mark_reminder_sent(reminder['id']) # Avoid re-sending to blocked user
+        time.sleep(0.5)
+
+
+# ==============================================================================
+# MAIN BOT LOGIC AND STARTUP
+# ==============================================================================
+def main():
+    # --- Preliminary Checks ---
+    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+        logger.critical("FATAL: TELEGRAM_BOT_TOKEN is not configured. Exiting.")
+        return
+    if YOUTUBE_API_KEY == "YOUR_YOUTUBE_API_KEY_HERE":
+        logger.critical("FATAL: YOUTUBE_API_KEY is not configured. Exiting.")
+        return
+    if not os.path.exists(GSHEET_SERVICE_ACCOUNT_FILE) and GSHEET_SERVICE_ACCOUNT_FILE != 'YOUR_SERVICE_ACCOUNT_JSON_PATH_IN_COLAB':
+         logger.warning(f"Google Sheets credential file '{GSHEET_SERVICE_ACCOUNT_FILE}' not found. Sheet features will be disabled.")
+    elif GSHEET_SERVICE_ACCOUNT_FILE == 'YOUR_SERVICE_ACCOUNT_JSON_PATH_IN_COLAB':
+         logger.warning("Google Sheets credentials path not set. Sheet features will be disabled.")
+
+
+    initialize_db() # Ensure tables exist
+
+    # --- Initialize Telegram Bot ---
+    updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
+    dispatcher = updater.dispatcher
+    job_queue = updater.job_queue
+
+    # --- Conversation Handlers ---
+    addchannel_handler_conv = ConversationHandler( # Managed by direct command args, not really a conversation anymore.
+        entry_points=[CommandHandler("addchannel", addchannel_entry, pass_args=True)],
+        states={}, # No states needed if handled in one go.
+        fallbacks=[], # No fallbacks needed
+        # If you wanted a multi-step /addchannel:
+        # states={
+        #     ASK_YT_URL: [MessageHandler(Filters.text & ~Filters.command, received_yt_url_for_addchannel)],
+        #     ASK_TG_GROUP_ID: [MessageHandler(Filters.text & ~Filters.command, received_tg_group_for_addchannel)],
+        # },
+        # fallbacks=[CommandHandler('cancel', cancel_conversation)],
+        # per_user=True, per_chat=True, # conversation_timeout=...
+    )
+
+    remindafter_handler_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("remindafter", remindafter_entry, pass_args=True), # Direct command
+            CallbackQueryHandler(ask_reminder_video_url, pattern=f"^{CB_SCHEDULE_REMINDER_VIDEO_URL}$") # Menu button
+        ],
+        states={
+            ASK_REMINDER_URL: [MessageHandler(Filters.text & ~Filters.command, received_reminder_url)],
+            ASK_REMINDER_MINUTES: [MessageHandler(Filters.text & ~Filters.command, received_reminder_minutes)],
+        },
+        fallbacks=[
+            CallbackQueryHandler(cancel_conversation, pattern=f"^{CB_BACK_TO_MAIN}$"), # Cancel from menu
+            CommandHandler('cancel', cancel_conversation) # /cancel command
+        ],
+         per_user=True, per_chat=True
+    )
+
+    admin_manual_upgrade_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_ask_user_id_for_upgrade, pattern=f"^{CB_ADMIN_MANAGE_UPGRADE_USER_INPUT}$")],
+        states={
+            ASK_USER_ID_FOR_UPGRADE: [MessageHandler(Filters.text & ~Filters.command, admin_received_user_id_for_upgrade)],
+            ASK_MONTHS_FOR_UPGRADE: [MessageHandler(Filters.text & ~Filters.command, admin_received_months_for_upgrade)],
+        },
+        fallbacks=[
+            CallbackQueryHandler(cancel_conversation, pattern=f"^{CB_ADMIN_MAIN}$"), # Cancel back to admin menu
+            CommandHandler('cancel', cancel_conversation)
+        ],
+        per_user=True, per_chat=True
+    )
+    admin_manual_downgrade_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_ask_user_id_for_downgrade, pattern=f"^{CB_ADMIN_MANAGE_DOWNGRADE_USER_INPUT}$")],
+        states={
+            ASK_USER_ID_FOR_DOWNGRADE: [MessageHandler(Filters.text & ~Filters.command, admin_received_user_id_for_downgrade)],
+        },
+        fallbacks=[
+            CallbackQueryHandler(cancel_conversation, pattern=f"^{CB_ADMIN_MAIN}$"),
+            CommandHandler('cancel', cancel_conversation)
+        ],
+        per_user=True, per_chat=True
+    )
+
+    add_group_to_channel_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ask_group_id_for_linking_entry, pattern=f"^{CB_ADD_GROUP_TO_CHANNEL_PREFIX}")],
+        states={
+            ASK_GROUP_ID_FOR_LINKING: [MessageHandler(Filters.text & ~Filters.command, received_group_id_for_linking)]
+        },
+        fallbacks=[
+            CallbackQueryHandler(cancel_add_group_conversation, pattern=f"^{CB_VIEW_CHANNEL_DETAILS_PREFIX}"), # This is a regex that needs to be careful, it's better if cancel has specific callback data
+            CommandHandler('cancel', cancel_conversation) # General cancel
+            # TODO: Add specific cancel callback button to the ask_group_id message, e.g., "cancel_add_group_op"
+        ],
+        per_user=True, per_chat=True
+    )
+
+
+    # --- Register Handlers ---
+    dispatcher.add_handler(CommandHandler("start", start_command, pass_args=True))
+    dispatcher.add_handler(CommandHandler("help", help_command))
+    dispatcher.add_handler(CommandHandler("myreferral", my_referral_command))
+    dispatcher.add_handler(addchannel_handler_conv) # For /addchannel command
+    dispatcher.add_handler(remindafter_handler_conv) # For /remindafter command and menu button
+    dispatcher.add_handler(CommandHandler("list", list_command)) # /list can also be main menu button
+    dispatcher.add_handler(CommandHandler("upgrade", upgrade_command)) # /upgrade can also be main menu button
+    dispatcher.add_handler(CommandHandler("admin", admin_command))
+    dispatcher.add_handler(CommandHandler("simpayment", simulate_payment_command, pass_args=True)) # Colab testing
+
+    dispatcher.add_handler(admin_manual_upgrade_conv)
+    dispatcher.add_handler(admin_manual_downgrade_conv)
+    dispatcher.add_handler(add_group_to_channel_conv)
+
+    dispatcher.add_handler(CallbackQueryHandler(callback_query_handler)) # Handles all other inline buttons
+
+    # --- Setup Scheduled Jobs using PTB JobQueue ---
+    # Check for new YouTube videos
+    job_queue.run_repeating(check_new_videos_job, interval=timedelta(minutes=VIDEO_CHECK_INTERVAL_MINUTES).total_seconds(), first=10) # first run after 10s
+    # Check for due reminders
+    job_queue.run_repeating(send_due_reminders_job, interval=timedelta(minutes=REMINDER_CHECK_INTERVAL_MINUTES).total_seconds(), first=5)
+    # Check for expired premium users (e.g., daily or hourly)
+    job_queue.run_repeating(expire_premium_users_job, interval=timedelta(hours=1).total_seconds(), first=60) # first run after 60s
+
+
+    # --- Start the Bot ---
+    logger.info("Bot starting polling...")
+    updater.start_polling()
+    updater.idle()
+    logger.info("Bot stopped.")
+
+if __name__ == '__main__':
+    main()
+
+```
+
+**How to Run in Google Colab:**
+
+1.  **Create a New Notebook:** Go to [colab.research.google.com](http://colab.research.google.com) and create a new Python 3 notebook.
+2.  **Paste the Code:** Copy the entire script above and paste it into a single code cell in your Colab notebook.
+3.  **Install Dependencies (Handled):** The `!pip install ...` lines at the beginning will take care of installing libraries within the Colab environment.
+4.  **Configure API Keys and Paths (CRITICAL):**
+    *   **`TELEGRAM_BOT_TOKEN`**: Replace `"YOUR_TELEGRAM_BOT_TOKEN_HERE"` with your actual bot token from BotFather.
+    *   **`YOUTUBE_API_KEY`**: Replace `"YOUR_YOUTUBE_API_KEY_HERE"` with your YouTube Data API v3 key from Google Cloud Console.
+    *   **`RAZORPAY_KEY_ID` & `RAZORPAY_KEY_SECRET`**: Replace placeholders if you have them (full functionality needs webhooks, which Colab doesn't easily support).
+    *   **`ADMIN_TELEGRAM_ID`**: Replace `123456789` with your personal Telegram User ID.
+    *   **`MANDATORY_JOIN_CHANNEL_ID`**: Set to your target channel's username (e.g., `@"mybotchannel"`) or its numeric ID.
+    *   **`GSHEET_SERVICE_ACCOUNT_FILE`**:
+        1.  Go to Google Cloud Console, create a service account, give it "Editor" access to Google Drive API and Google Sheets API.
+        2.  Download the JSON key file for this service account.
+        3.  In Colab, on the left sidebar, click the "Files" icon (folder).
+        4.  Click "Upload to session storage" and upload your `service-account-credentials.json` (or whatever you named it).
+        5.  Modify the line `GSHEET_SERVICE_ACCOUNT_FILE = os.getenv("GSHEET_SERVICE_ACCOUNT_FILE", 'YOUR_SERVICE_ACCOUNT_JSON_PATH_IN_COLAB')` to be `GSHEET_SERVICE_ACCOUNT_FILE = '/content/your-service-account-file.json'`. Make sure the path is correct.
+6.  **Run the Cell:** Click the "Play" button to the left of the code cell (or press Ctrl+Enter / Cmd+Enter).
+7.  **Interact with your Bot:** Go to Telegram and start interacting with your bot.
+
+**Important Considerations for Colab:**
+
+*   **Session Lifetime:** Colab notebooks have a limited session lifetime (typically 12 hours, less if inactive). If the Colab instance disconnects or resets, the bot will stop, and the SQLite database (`bot_data.db`) created in session storage will be **lost**.
+    *   For persistence, you'd need to regularly download `bot_data.db` or implement logic to save/load it from your Google Drive.
+*   **No Webhooks:** Features requiring webhooks (like real-time Razorpay payment confirmations) won't work as Colab is not a persistent public server. The `/simpayment` command is a workaround for testing the upgrade logic.
+*   **Resource Limits:** Colab has resource limits. Very high traffic or intensive processing might hit these.
+*   **Debugging:** Use `print()` statements or the `logger` for debugging directly in the Colab output.
+
+This script is a substantial starting point. You will likely encounter issues and need to debug specific parts (especially API interactions and database logic) as you test it. Good luck!
